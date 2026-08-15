@@ -209,3 +209,7 @@ now included as its own tab (Divergence Screener), separate from PSX
 ## Verification
 
 See `VERIFICATION.md` for the fixes, regression checks, and the exact live Render/PSX checks still required after deployment. The included `tests/test_math.py` and `tests/test_frontend_static.py` cover the calculation and UI-wiring regressions.
+
+
+## V10 update
+See `V10_FIX_NOTES.md` for the corrected 1H/5H/1D/5D chart ranges, PSX closed-market ticker status, Insider Transactions research section, source-backed EPS/dividend/volume fields, and divergence volume columns.

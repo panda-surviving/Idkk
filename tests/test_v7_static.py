@@ -5,6 +5,7 @@ APP = (ROOT / "app.py").read_text()
 JS = (ROOT / "static/app.js").read_text()
 HTML = (ROOT / "templates/index.html").read_text()
 SW = (ROOT / "static/sw.js").read_text()
+CORE = (ROOT / "psx_screener.py").read_text()
 
 
 def test_divergence_progress_has_real_universe_before_callback():
@@ -16,14 +17,14 @@ def test_divergence_progress_has_real_universe_before_callback():
 
 
 def test_personalized_setup_is_a_real_conjunction():
-    assert 'bullish_setup = bool(is_near_low and bullish_divergence_any_tf and bullish_zone and structure == "downtrend" and ha_color == "green")' in APP
-    assert 'bearish_setup = bool(bearish_divergence_any_tf and bearish_zone and structure == "uptrend" and ha_color == "red")' in APP
+    assert 'bullish_setup = bool(is_near_low and any(tf_setup_ok(hit, "bullish") for hit in bullish_tf_hits) and ha_color == "green")' in APP
+    assert 'bearish_setup = bool(any(tf_setup_ok(hit, "bearish") for hit in bearish_tf_hits) and ha_color == "red")' in APP
 
 
 def test_intraday_chart_timeframes_are_wired():
-    assert '"1D": {"intraday_interval": "5m", "intraday_period": "1d"}' in APP
-    assert '"5D": {"intraday_interval": "15m", "intraday_period": "5d"}' in APP
-    assert '"1H": {"intraday_interval": "60m", "intraday_period": "60d"}' in APP
+    assert '"1D": {"intraday_interval": "15m", "intraday_period": "5d"' in APP
+    assert '"5D": {"intraday_interval": "30m", "intraday_period": "60d"' in APP
+    assert '"1H": {"intraday_interval": "5m", "intraday_period": "1d"' in APP
     assert 'data-tf="1D"' in HTML and 'data-tf="1H"' in HTML
 
 
@@ -49,3 +50,13 @@ def test_announcement_feed_has_multiple_official_streams():
     assert 'NCCPL Notices' in APP
     assert 'Payouts' in APP
     assert 'psx-360-shell-v7' in SW
+
+
+def test_divergence_scans_multiple_recent_pivot_pairs():
+    assert "for j in range(len(positions) - 1, 0, -1):" in CORE
+    assert "for i in range(j - 1, max(-1, j - 6), -1):" in CORE
+
+
+def test_multi_timeframe_setup_uses_matching_timeframe():
+    assert 'tf_setup_ok(hit, "bullish")' in APP
+    assert 'tf_setup_ok(hit, "bearish")' in APP

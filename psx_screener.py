@@ -69,40 +69,40 @@ RSI_PERIOD = 14
 # How many bars on either side a point needs to be the smallest/largest
 # in order to count as a "swing low" / "swing high" (for divergence
 # detection). Higher = fewer, more significant swings.
-SWING_ORDER = 8
+SWING_ORDER = 5
 
 # Only look for divergence using swing lows that occurred within the last
 # N trading days (keeps it focused on the recent price action).
-DIVERGENCE_LOOKBACK_DAYS = 90
+DIVERGENCE_LOOKBACK_DAYS = 120
 
 # --- Significance filters (avoid flagging noisy, meaningless "divergences") ---
 # The 2nd low must be at least this % BELOW the 1st low to count as a real
 # "lower low" (not just a fraction of a percent of noise).
-MIN_PRICE_DROP_PCT = 1.5
+MIN_PRICE_DROP_PCT = 0.25
 
 # RSI at the 2nd low must be at least this many points HIGHER than at the
 # 1st low to count as a real "higher low".
-MIN_RSI_RISE_POINTS = 5.0
+MIN_RSI_RISE_POINTS = 2.0
 
 # --- Bearish divergence significance filters (mirror image of above) ---
 # The 2nd high must be at least this % ABOVE the 1st high to count as a
 # real "higher high".
-MIN_PRICE_RISE_PCT = 1.5
+MIN_PRICE_RISE_PCT = 0.25
 
 # RSI at the 2nd high must be at least this many points LOWER than at the
 # 1st high to count as a real "lower high".
-MIN_RSI_DROP_POINTS = 5.0
+MIN_RSI_DROP_POINTS = 2.0
 
 # --- Trend structure classification (higher-high/higher-low vs
 # lower-high/lower-low) ---
 # How many trading days back to look when classifying a stock's overall
 # structure as an uptrend or downtrend.
-STRUCTURE_LOOKBACK_DAYS = 150
+STRUCTURE_LOOKBACK_DAYS = 180
 
 # Swing significance for structure classification (separate from the
 # divergence swing detection above, since structure is usually judged
 # over a longer window with bigger swings).
-STRUCTURE_SWING_ORDER = 8
+STRUCTURE_SWING_ORDER = 5
 
 # Skip stocks with fewer than this many closing prices with real trading
 # (avoids illiquid / recently-listed / suspended scrips producing noise).
@@ -289,107 +289,86 @@ def find_swing_lows(series: pd.Series, order: int = 5):
 def check_bullish_divergence(df: pd.DataFrame, lookback_days: int, swing_order: int,
                               min_price_drop_pct: float = MIN_PRICE_DROP_PCT,
                               min_rsi_rise_points: float = MIN_RSI_RISE_POINTS):
-    """
-    Look at the most recent two swing lows in price within `lookback_days`.
-    Bullish divergence = price's 2nd low < 1st low (by at least
-    `min_price_drop_pct`), AND RSI's 2nd low > 1st low (by at least
-    `min_rsi_rise_points`). The minimums filter out noisy, meaningless
-    "divergences" where the two lows are basically the same value.
+    """Find the most recent *qualifying* bullish RSI divergence.
 
-    Returns a dict with divergence details if found, else None.
+    Older versions only tested the last two swing lows. That caused valid
+    divergences to disappear whenever the newest swing was not the divergent
+    one. We now examine recent swing-low pairs from newest to oldest and return
+    the newest pair that satisfies the mathematical lower-low / higher-RSI rule.
     """
     recent = df.iloc[-lookback_days:].reset_index(drop=True)
     if len(recent) < swing_order * 2 + 2:
         return None
-
     price_col = "low" if (PRICE_BASIS == "low" and "low" in recent.columns) else "close"
-    swing_positions = find_swing_lows(recent[price_col], order=swing_order)
-    if len(swing_positions) < 2:
+    positions = find_swing_lows(recent[price_col], order=swing_order)
+    if len(positions) < 2:
         return None
-
-    # Take the two most recent swing lows
-    p2_idx, p1_idx = swing_positions[-1], swing_positions[-2]
-    # p1 = earlier low, p2 = later (more recent) low
-    # Price comparison uses the actual intraday low (the candle wick) -
-    # matching what you'd see and draw a trendline through on a chart.
-    p1_price = recent[price_col].iloc[p1_idx]
-    p2_price = recent[price_col].iloc[p2_idx]
-    p1_rsi = recent["rsi"].iloc[p1_idx]
-    p2_rsi = recent["rsi"].iloc[p2_idx]
-    p1_date = recent["date"].iloc[p1_idx]
-    p2_date = recent["date"].iloc[p2_idx]
-
-    price_drop_pct = (p1_price - p2_price) / p1_price * 100
-    rsi_rise_points = p2_rsi - p1_rsi
-
-    is_real_lower_low = price_drop_pct >= min_price_drop_pct
-    is_real_higher_low = rsi_rise_points >= min_rsi_rise_points
-
-    if is_real_lower_low and is_real_higher_low:
-        return {
-            "pivot1_date": p1_date.date(),
-            "pivot1_price": round(float(p1_price), 2),
-            "pivot1_rsi": round(float(p1_rsi), 1),
-            "pivot2_date": p2_date.date(),
-            "pivot2_price": round(float(p2_price), 2),
-            "pivot2_rsi": round(float(p2_rsi), 1),
-            "price_change_pct": round(float(-price_drop_pct), 2),
-            "rsi_change_points": round(float(rsi_rise_points), 1),
-        }
+    for j in range(len(positions) - 1, 0, -1):
+        p2_idx = positions[j]
+        for i in range(j - 1, max(-1, j - 6), -1):
+            p1_idx = positions[i]
+            if p2_idx - p1_idx < max(3, swing_order):
+                continue
+            p1_price, p2_price = float(recent[price_col].iloc[p1_idx]), float(recent[price_col].iloc[p2_idx])
+            p1_rsi, p2_rsi = float(recent["rsi"].iloc[p1_idx]), float(recent["rsi"].iloc[p2_idx])
+            if p1_price <= 0:
+                continue
+            price_drop_pct = (p1_price - p2_price) / p1_price * 100
+            rsi_rise_points = p2_rsi - p1_rsi
+            if price_drop_pct >= min_price_drop_pct and rsi_rise_points >= min_rsi_rise_points:
+                return {
+                    "pivot1_date": recent["date"].iloc[p1_idx].date(),
+                    "pivot1_price": round(p1_price, 2),
+                    "pivot1_rsi": round(p1_rsi, 1),
+                    "pivot2_date": recent["date"].iloc[p2_idx].date(),
+                    "pivot2_price": round(p2_price, 2),
+                    "pivot2_rsi": round(p2_rsi, 1),
+                    "price_change_pct": round(-price_drop_pct, 2),
+                    "rsi_change_points": round(rsi_rise_points, 1),
+                    "pivot2_index": int(p2_idx),
+                }
     return None
-
 
 def check_bearish_divergence(df: pd.DataFrame, lookback_days: int, swing_order: int,
                               min_price_rise_pct: float = MIN_PRICE_RISE_PCT,
                               min_rsi_drop_points: float = MIN_RSI_DROP_POINTS):
-    """
-    Mirror image of check_bullish_divergence: looks at the two most recent
-    swing HIGHS. Bearish divergence = price's 2nd high > 1st high (by at
-    least `min_price_rise_pct`), AND RSI's 2nd high < 1st high (by at least
-    `min_rsi_drop_points`). This pattern often signals weakening upside
-    momentum - a possible warning sign in an uptrend.
+    """Find the most recent qualifying bearish RSI divergence.
 
-    Returns a dict with divergence details if found, else None.
+    Tests recent swing-high pairs instead of only the newest two, preventing a
+    newer non-divergent high from hiding a still-valid bearish divergence.
     """
     recent = df.iloc[-lookback_days:].reset_index(drop=True)
     if len(recent) < swing_order * 2 + 2:
         return None
-
-    # Bearish divergence is defined on actual swing highs.  Do not switch to
-    # closing-price pivots merely because the 52-week-low screen uses a
-    # different price basis.
     price_col = "high" if "high" in recent.columns else "close"
-    swing_positions = find_swing_extrema(recent[price_col], order=swing_order, kind="high")
-    if len(swing_positions) < 2:
+    positions = find_swing_extrema(recent[price_col], order=swing_order, kind="high")
+    if len(positions) < 2:
         return None
-
-    p2_idx, p1_idx = swing_positions[-1], swing_positions[-2]
-    p1_price = recent[price_col].iloc[p1_idx]
-    p2_price = recent[price_col].iloc[p2_idx]
-    p1_rsi = recent["rsi"].iloc[p1_idx]
-    p2_rsi = recent["rsi"].iloc[p2_idx]
-    p1_date = recent["date"].iloc[p1_idx]
-    p2_date = recent["date"].iloc[p2_idx]
-
-    price_rise_pct = (p2_price - p1_price) / p1_price * 100
-    rsi_drop_points = p1_rsi - p2_rsi
-
-    is_real_higher_high = price_rise_pct >= min_price_rise_pct
-    is_real_lower_high = rsi_drop_points >= min_rsi_drop_points
-
-    if is_real_higher_high and is_real_lower_high:
-        return {
-            "pivot1_date": p1_date.date(),
-            "pivot1_price": round(float(p1_price), 2),
-            "pivot1_rsi": round(float(p1_rsi), 1),
-            "pivot2_date": p2_date.date(),
-            "pivot2_price": round(float(p2_price), 2),
-            "pivot2_rsi": round(float(p2_rsi), 1),
-            "price_change_pct": round(float(price_rise_pct), 2),
-            "rsi_change_points": round(float(-rsi_drop_points), 1),
-        }
+    for j in range(len(positions) - 1, 0, -1):
+        p2_idx = positions[j]
+        for i in range(j - 1, max(-1, j - 6), -1):
+            p1_idx = positions[i]
+            if p2_idx - p1_idx < max(3, swing_order):
+                continue
+            p1_price, p2_price = float(recent[price_col].iloc[p1_idx]), float(recent[price_col].iloc[p2_idx])
+            p1_rsi, p2_rsi = float(recent["rsi"].iloc[p1_idx]), float(recent["rsi"].iloc[p2_idx])
+            if p1_price <= 0:
+                continue
+            price_rise_pct = (p2_price - p1_price) / p1_price * 100
+            rsi_drop_points = p1_rsi - p2_rsi
+            if price_rise_pct >= min_price_rise_pct and rsi_drop_points >= min_rsi_drop_points:
+                return {
+                    "pivot1_date": recent["date"].iloc[p1_idx].date(),
+                    "pivot1_price": round(p1_price, 2),
+                    "pivot1_rsi": round(p1_rsi, 1),
+                    "pivot2_date": recent["date"].iloc[p2_idx].date(),
+                    "pivot2_price": round(p2_price, 2),
+                    "pivot2_rsi": round(p2_rsi, 1),
+                    "price_change_pct": round(price_rise_pct, 2),
+                    "rsi_change_points": round(-rsi_drop_points, 1),
+                    "pivot2_index": int(p2_idx),
+                }
     return None
-
 
 def classify_structure(df: pd.DataFrame, lookback_days: int, swing_order: int):
     """

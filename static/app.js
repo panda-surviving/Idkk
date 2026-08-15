@@ -123,6 +123,7 @@ const pageMeta = {
   macro: ["Pakistan Macro", "Key economic indicators"],
   news: ["News", "Company and market updates"],
   announcements: ["Announcements", "All PSX company announcements and notices"],
+  insider: ["Insider Transactions", "PSX director, executive and substantial-shareholder disclosures"],
   journal: ["Journal", "Analysis, education and podcasts"],
   tools: ["Tools", "Calculators built around your money"],
   worldclock: ["World Clock", "Global trading sessions at a glance"],
@@ -240,6 +241,7 @@ async function go(page) {
   if (page === "cryptotech") await loadCryptoTechCached();
   if (["dashboard", "sentiment", "sectors", "macro", "news", "announcements"].includes(page)) await loadExtras();
   if (page === "announcements") await loadAllPsxAnnouncements();
+  if (page === "insider") await loadPsxInsiderTransactions();
   if (page === "macro") await loadMacroPage();
 }
 
@@ -1051,6 +1053,9 @@ function renderSymbolPage() {
     const price = live?.price;
     const changePct = live?.change_pct;
     const pe = live?.pe_ratio;
+    const eps = live?.eps;
+    const dividendYield = live?.dividend_yield;
+    const avgVolume = live?.volume_30d_avg;
     const rsi = live?.rsi14;
     const trend = live?.golden_death_cross;
     const dataDays = live?.data_days || 0;
@@ -1068,7 +1073,10 @@ function renderSymbolPage() {
           ${changePct == null ? "—" : `${changePct >= 0 ? "+" : ""}${Number(changePct).toFixed(2)}%`}
         </td>
         <td>${volume == null ? "—" : Number(volume).toLocaleString()}</td>
+        <td>${avgVolume == null ? "—" : Number(avgVolume).toLocaleString()}</td>
         <td>${pe == null ? "—" : Number(pe).toFixed(2)}</td>
+        <td>${eps == null ? "—" : Number(eps).toFixed(2)}</td>
+        <td>${dividendYield == null ? "—" : `${Number(dividendYield).toFixed(2)}%`}</td>
         <td>
           ${rsi == null
             ? `<span class="soft-chip" title="Needs 15 recorded trading days">${dataDays}/15 days</span>`
@@ -1405,10 +1413,13 @@ async function loadFundamentals(symbol) {
       metric("1Y Change", f.one_year_change_pct == null ? null : `${Number(f.one_year_change_pct).toFixed(2)}%`) +
       metric("YTD Change", f.ytd_change_pct == null ? null : `${Number(f.ytd_change_pct).toFixed(2)}%`) +
       metric("LDCP", f.ldcp == null ? null : Number(f.ldcp).toFixed(2)) +
-      metric("EPS (TTM)", f.eps_ttm == null ? "Needs data vendor" : f.eps_ttm) +
-      metric("Book Value / Share", f.book_value_per_share == null ? "Needs data vendor" : f.book_value_per_share) +
-      metric("Dividend Yield", f.dividend_yield_pct == null ? "Needs data vendor" : `${f.dividend_yield_pct}%`) +
-      metric("Dividend History", f.dividend_history.length ? `${f.dividend_history.length} records` : "Needs data vendor");
+      metric(f.eps_ttm != null ? "EPS (TTM)" : "EPS (Latest Annual)", f.eps_ttm != null ? Number(f.eps_ttm).toFixed(2) : (f.eps_latest_annual == null ? null : Number(f.eps_latest_annual).toFixed(2))) +
+      metric("Book Value / Share", f.book_value_per_share == null ? null : Number(f.book_value_per_share).toFixed(2)) +
+      metric("P/B", f.price_to_book == null ? null : Number(f.price_to_book).toFixed(2)) +
+      metric("Dividend Yield", f.dividend_yield_pct == null ? null : `${Number(f.dividend_yield_pct).toFixed(2)}%`) +
+      metric("Volume", f.volume == null ? null : Number(f.volume).toLocaleString()) +
+      metric("30D Avg Volume", f.volume_30d_avg == null ? null : Number(f.volume_30d_avg).toLocaleString()) +
+      metric("Free Float", f.free_float_pct == null ? null : `${Number(f.free_float_pct).toFixed(2)}%`);
 
     if (f.pe_ratio_ttm != null) {
       const peScaled = Math.max(0, Math.min(100, (f.pe_ratio_ttm / 40) * 100));
@@ -1614,6 +1625,32 @@ async function loadExtras() {
         <div class="announcement-card"><div class="announcement-symbol">${esc(item.symbol)}</div><div><strong>${esc(item.title)}</strong><small>${esc(item.time)}</small></div></div>
       `).join("");
     }
+  }
+}
+
+async function loadPsxInsiderTransactions() {
+  const el = $("insiderTransactionsList");
+  if (!el) return;
+  el.innerHTML = `<div class="loading-panel">Loading PSX insider/director disclosures…</div>`;
+  try {
+    const d = await getJSON("/api/psx/insider-transactions?limit=100");
+    const rows = d.transactions || [];
+    el.innerHTML = rows.length ? rows.map(item => {
+      const direction = item.direction === "buy" ? "BUY" : item.direction === "sell" ? "SELL" : "DISCLOSURE";
+      const body = `
+        <div class="announcement-symbol">${esc(item.symbol || "PSX")}</div>
+        <div>
+          <strong>${esc(item.title || item.text || "PSX insider disclosure")}</strong>
+          <small>${esc(direction)}${item.date ? ` · ${esc(item.date)}` : ""} · Official PSX filing</small>
+        </div>`;
+      return item.url
+        ? `<a class="announcement-card clickable-row" href="${esc(item.url)}" target="_blank" rel="noopener">${body}</a>`
+        : `<div class="announcement-card">${body}</div>`;
+    }).join("") : `<div class="empty-chart">No insider/director disclosure filings were returned by PSX right now.</div>`;
+    const note = $("insiderTransactionsNote");
+    if (note) note.textContent = d.note || "";
+  } catch (e) {
+    el.innerHTML = `<div class="error-panel">Could not load PSX insider disclosures: ${esc(e.message)}</div>`;
   }
 }
 
@@ -3362,6 +3399,10 @@ async function loadDashboardTickers() {
 
     const psxItems = stocks.items.filter(s => s.price != null).slice(0, 15)
       .map(s => ({ symbol: s.symbol, price: Number(s.price).toFixed(2), pct: Number(s.change_pct || 0) }));
+    const psxStatus = stocks.market_status || {};
+    const psxLabel = psxStatus.is_open
+      ? "PSX LIVE"
+      : `PSX LIVE · CLOSED · LAST SESSION ${psxStatus.last_session_date || ""}`;
 
     const cryptoItems = crypto.coins.slice(0, 15)
       .map(c => ({ symbol: c.symbol, price: "$" + Number(c.current_price).toLocaleString(undefined, {maximumFractionDigits: c.current_price < 1 ? 4 : 2}), pct: Number(c.price_change_percentage_24h || 0) }));
@@ -3373,7 +3414,7 @@ async function loadDashboardTickers() {
       .map(f => ({ symbol: f.name.slice(0, 22), price: Number(f.nav).toFixed(2), pct: Number(f.ytd || 0) }));
 
     $("globalTickerBar").innerHTML = [
-      psxItems.length ? buildTickerStrip("PSX LIVE", psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">PSX LIVE</span><span class="ticker-item">Warming live PSX quotes…</span></div>`,
+      psxItems.length ? buildTickerStrip(psxLabel, psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">${esc(psxLabel)}</span><span class="ticker-item">${esc(psxStatus.label || "Waiting for the latest PSX snapshot…")}</span></div>`,
       cryptoItems.length ? buildTickerStrip("CRYPTO LIVE", cryptoItems) : "",
       forexItems.length ? buildTickerStrip("FOREX LIVE", forexItems) : "",
       fundItems.length ? buildTickerStrip("MUTUAL FUNDS", fundItems) : "",
@@ -3851,6 +3892,7 @@ const PSX_DIV_COLS = [
   { key: "week52_low", label: "52W Low", fmt: "num2" },
   { key: "pct_above_52w_low", label: "% Above 52W Low", fmt: "pct" },
   { key: "latest_rsi", label: "RSI (14)", fmt: "num1" },
+  { key: "volume", label: "Volume", fmt: "int" },
   { key: "div_1d", label: "1D Divergence" },
   { key: "div_1w", label: "1W Divergence" },
   { key: "div_1m", label: "1M Divergence" },
@@ -3889,6 +3931,7 @@ function renderPsxDivTable(rows, cols) {
 }
 
 function renderPsxDivergenceResult(result, resultsEl) {
+  const scanSummary = `<div class="tech-scan-block"><h3>Scan Summary</h3><p class="muted-note">Universe: <strong>${Number(result.universe_count || result.symbols_scanned || 0).toLocaleString()}</strong> symbols · Usable data: <strong>${Number(result.symbols_with_data || 0).toLocaleString()}</strong> · Insufficient history: <strong>${Number(result.symbols_skipped_insufficient_history || 0).toLocaleString()}</strong> · Failed: <strong>${Number(result.symbols_failed || 0).toLocaleString()}</strong> · Bullish divergence hits: <strong>${Number((result.bullish_divergence_all || []).length).toLocaleString()}</strong> · Bearish divergence hits: <strong>${Number((result.bearish_divergence_all || []).length).toLocaleString()}</strong></p></div>`;
   const sections = [
     ["personalized_matches", "Personalized PSX Setup — Confirmed Matches", "A bullish reversal requires all of: within 3% of the 52-week low, bullish RSI divergence on at least one of 1D/1W/1M, pivot RSI ≤50 (strong ≤30), downtrend structure (LH+LL), and a green Heikin-Ashi confirmation. A bearish reversal requires bearish divergence on at least one timeframe, pivot RSI ≥70 (strong ≥90), uptrend structure (HH+HL), and a red Heikin-Ashi confirmation."],
     ["near_low_bullish_divergence", "52-Week Low + Bullish RSI Divergence", "Price is within the configured 3% of its 52-week low AND has a mathematically confirmed bullish RSI divergence."],
@@ -3899,7 +3942,7 @@ function renderPsxDivergenceResult(result, resultsEl) {
     ["downtrend_divergence", "Divergence Within a Downtrend", "Confirmed divergence occurring in a lower-high/lower-low structure."],
   ];
 
-  let html = "";
+  let html = scanSummary;
   for (const [key, title, desc] of sections) {
     html += `<div class="tech-scan-block"><h3>${esc(title)}</h3><p class="muted-note">${esc(desc)}</p>${renderPsxDivTable(result[key])}</div>`;
   }
@@ -4061,7 +4104,7 @@ async function loadStockChart(symbol, timeframe) {
       ["mainPriceChart", "volumeChart", "rsiChart", "macdChart"].forEach(id => { if ($(id)) $(id).innerHTML = ""; });
       return;
     }
-    statusEl.textContent = d.data_source ? `Real market data: ${d.data_source}` : "";
+    statusEl.textContent = d.data_source ? `${d.data_source} · ${d.timeframe || currentChartTimeframe}` : "";
     lastChartData = d;
     // Render on the next paint so the stock-detail page has a real width
     // after navigation; Lightweight Charts otherwise initializes at 0px on
