@@ -3932,8 +3932,24 @@ async function runPsxDivergenceScan() {
       throw new Error("Server returned an invalid scan job ID. Please reload the page and try again.");
     }
 
+    let transientStatusErrors = 0;
     while (true) {
-      const data = await getJSON("/api/psxdivergence/scan/status/" + encodeURIComponent(jobId), { timeoutMs: 30000 });
+      let data;
+      try {
+        data = await getJSON("/api/psxdivergence/scan/status/" + encodeURIComponent(jobId), { timeoutMs: 10000 });
+        transientStatusErrors = 0;
+      } catch (statusErr) {
+        // Render/iPad can occasionally surface a transient HTML 502 while a
+        // worker is busy. Do not throw away a valid long-running scan: retry
+        // the tiny status endpoint before declaring the scan failed.
+        transientStatusErrors += 1;
+        if (transientStatusErrors <= 8) {
+          statusEl.textContent = `Reconnecting to scan worker… (${transientStatusErrors}/8)`;
+          await new Promise(r => setTimeout(r, Math.min(8000, 1500 * transientStatusErrors)));
+          continue;
+        }
+        throw statusErr;
+      }
       if (!data.ok || data.status === "error") {
         statusEl.textContent = "Error: " + (data.error || "scan failed");
         return;

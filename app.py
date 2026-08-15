@@ -13,6 +13,8 @@ import uuid
 import datetime as dt
 import math
 import os
+import sys
+import subprocess
 from bs4 import BeautifulSoup
 
 # numpy/pandas power the intraday RSI-divergence technical scanners
@@ -4949,8 +4951,14 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
 # PSX throttles repeated historical POSTs fairly aggressively. Four workers
 # keeps the scan materially faster than serial requests without creating the
 # burst of simultaneous connections that caused the original timeout failures.
-PSX_DIVERGENCE_SCAN_WORKERS = 8
+PSX_DIVERGENCE_SCAN_WORKERS = max(2, min(4, int(os.environ.get("PSX_DIVERGENCE_SCAN_WORKERS", "4"))))
 PSX_DIVERGENCE_HISTORY_CACHE_HOURS = 24
+PSX_DIVERGENCE_BATCH_SIZE = max(50, min(90, int(os.environ.get("PSX_DIVERGENCE_BATCH_SIZE", "75"))))
+PSX_DIVERGENCE_BATCH_WORKERS = max(1, min(2, int(os.environ.get("PSX_DIVERGENCE_BATCH_WORKERS", "2"))))
+PSX_DIVERGENCE_JOB_MAX_SECONDS = 45 * 60
+PSX_DIVERGENCE_JOB_DIR = BASE / ".psx_divergence_jobs"
+PSX_DIVERGENCE_JOB_DIR.mkdir(parents=True, exist_ok=True)
+_psx_divergence_spawn_lock = threading.Lock()
 _psx_divergence_history_cache = {}
 _psx_divergence_history_cache_lock = threading.Lock()
 
@@ -5144,7 +5152,7 @@ def run_psx_divergence_scan(progress_cb=None):
     prefetch_started = time.time()
     if progress_cb:
         progress_cb(0, total, f"Preparing batched PSX history for {total} symbols…")
-    prefetched = _prefetch_psx_histories_batch(tickers, period="2y", batch_size=40, max_workers=3)
+    prefetched = _prefetch_psx_histories_batch(tickers, period="2y", batch_size=PSX_DIVERGENCE_BATCH_SIZE, max_workers=PSX_DIVERGENCE_BATCH_WORKERS)
     prefetch_seconds = round(time.time() - prefetch_started, 2)
     if progress_cb:
         progress_cb(min(prefetched, total), total, f"History cache warmed for {prefetched}/{total} symbols")
@@ -5233,17 +5241,98 @@ def run_psx_divergence_scan(progress_cb=None):
     }
 
 
-def _run_psx_divergence_job_in_background(job_id):
-    def worker():
+def _psx_job_path(job_id):
+    return PSX_DIVERGENCE_JOB_DIR / f"{job_id}.json"
+
+def _psx_write_job(job_id, payload):
+    path = _psx_job_path(job_id)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(_clean_for_json(payload), separators=(",", ":")), encoding="utf-8")
+    os.replace(tmp, path)
+
+def _psx_read_job(job_id):
+    try:
+        return json.loads(_psx_job_path(job_id).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+def _psx_mark_job_error_if_dead(job):
+    if not job or job.get("status") != "running":
+        return job
+    pid = int(job.get("pid") or 0)
+    started = float(job.get("started_epoch") or 0)
+    alive = False
+    if pid > 0:
         try:
-            def progress_cb(done, tot, sym):
-                _update_tech_job(job_id, progress={"done": done, "total": tot, "symbol": sym})
-            result = run_psx_divergence_scan(progress_cb=progress_cb)
-            _save_tech_cache("psxdivergence", result)
-            _update_tech_job(job_id, status="done", result=result)
-        except Exception as e:
-            _update_tech_job(job_id, status="error", error=str(e))
-    threading.Thread(target=worker, daemon=True).start()
+            os.kill(pid, 0)
+            alive = True
+        except OSError:
+            alive = False
+    if alive and started and time.time() - started > PSX_DIVERGENCE_JOB_MAX_SECONDS:
+        alive = False
+    if not alive:
+        job = dict(job)
+        job.update({"status": "error", "error": "Scan worker stopped before completing. Start a new scan."})
+        _psx_write_job(job["job_id"], job)
+    return job
+
+def _psx_latest_running_job():
+    now = time.time()
+    for path in sorted(PSX_DIVERGENCE_JOB_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        job = _psx_read_job(path.stem)
+        if not job or job.get("status") != "running":
+            continue
+        job = _psx_mark_job_error_if_dead(job)
+        if job.get("status") == "running" and now - float(job.get("started_epoch", now)) < PSX_DIVERGENCE_JOB_MAX_SECONDS:
+            return job
+    return None
+
+def _psx_persistent_result():
+    path = PSX_DIVERGENCE_JOB_DIR / "latest_result.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload
+    except Exception:
+        return None
+
+def _psx_save_persistent_result(result):
+    path = PSX_DIVERGENCE_JOB_DIR / "latest_result.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(_clean_for_json(result), separators=(",", ":")), encoding="utf-8")
+    os.replace(tmp, path)
+
+def _spawn_psx_divergence_worker(job_id):
+    worker_script = BASE / "psx_divergence_worker.py"
+    env = os.environ.copy()
+    env["PSX_SCAN_JOB_ID"] = job_id
+    env["PYTHONUNBUFFERED"] = "1"
+    return subprocess.Popen(
+        [sys.executable, str(worker_script)],
+        cwd=str(BASE),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+def _run_psx_divergence_job_in_background(job_id):
+    # Run the expensive scan OUTSIDE the Gunicorn worker. A single Render
+    # web worker must stay responsive to /scan/status while Yahoo/PSX I/O and
+    # pandas calculations run. The old in-process thread could starve/crash
+    # the Gunicorn worker and make Render return an HTML 502 to the browser.
+    with _psx_divergence_spawn_lock:
+        running = _psx_latest_running_job()
+        if running and running.get("job_id") != job_id:
+            return running.get("pid")
+        proc = _spawn_psx_divergence_worker(job_id)
+        job = _psx_read_job(job_id) or {}
+        job.update({"job_id": job_id, "pid": proc.pid, "status": "running",
+                    "started_epoch": time.time(), "progress": {"done": 0, "total": 0, "symbol": ""},
+                    "result": None, "error": None})
+        _psx_write_job(job_id, job)
+        return proc.pid
 
 
 @app.get("/api/psxdivergence/scan/start")
@@ -5252,17 +5341,23 @@ def api_psx_divergence_scan_start():
     if guard:
         return guard
     try:
-        # Show the most recent full-market result immediately when one exists,
-        # while a fresh scan runs in the background. This prevents the UI from
-        # appearing frozen for several minutes on a Render free-tier wake-up.
         cached = _load_tech_cache("psxdivergence")
-        job_id = _new_tech_job()
-        _run_psx_divergence_job_in_background(job_id)
-        payload = {"ok": True, "job_id": job_id, "message": "Market-wide PSX scan started."}
+        persistent = _psx_persistent_result()
+        running = _psx_latest_running_job()
+        if running:
+            payload = {"ok": True, "job_id": running["job_id"], "message": "A full PSX scan is already running."}
+        else:
+            job_id = str(uuid.uuid4())
+            _psx_write_job(job_id, {"job_id": job_id, "status": "starting", "pid": 0, "started_epoch": time.time(),
+                                    "progress": {"done": 0, "total": 0, "symbol": ""}, "result": None, "error": None})
+            _run_psx_divergence_job_in_background(job_id)
+            payload = {"ok": True, "job_id": job_id, "message": "Full PSX scan started in a separate worker."}
         if cached and cached.get("data"):
             payload["cached_result"] = cached["data"]
             payload["cached_saved_at"] = cached.get("saved_at")
-            payload["message"] = "Showing the last full-market scan immediately while a fresh scan runs in the background."
+        elif persistent:
+            payload["cached_result"] = persistent.get("result", persistent)
+            payload["cached_saved_at"] = persistent.get("saved_at")
         response = safe_jsonify(payload)
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return response
@@ -5274,11 +5369,18 @@ def api_psx_divergence_scan_start():
 
 @app.get("/api/psxdivergence/scan/status/<job_id>")
 def api_psx_divergence_scan_status(job_id):
-    job = _get_tech_job(job_id)
+    # Status is deliberately file-backed and tiny. It remains available even
+    # if the expensive scan worker is using lots of CPU/memory or Gunicorn has
+    # restarted since the scan began. Never proxy the full scan through this
+    # endpoint.
+    job = _psx_read_job(job_id)
     if job is None:
-        response = safe_jsonify({"ok": False, "error": "Unknown job id (server may have restarted)."})
+        job = _get_tech_job(job_id)
+    if job is None:
+        response = safe_jsonify({"ok": False, "error": "Unknown job id. The scan worker may have been restarted."})
         response.headers["Cache-Control"] = "no-store"
         return response, 404
+    job = _psx_mark_job_error_if_dead(job)
     response = safe_jsonify({"ok": True, **job})
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
@@ -5287,9 +5389,12 @@ def api_psx_divergence_scan_status(job_id):
 @app.get("/api/psxdivergence/scan/cached")
 def api_psx_divergence_scan_cached():
     cached = _load_tech_cache("psxdivergence")
-    if cached is None:
-        return safe_jsonify({"ok": True, "found": False})
-    return safe_jsonify({"ok": True, "found": True, "result": cached["data"], "saved_at": cached["saved_at"]})
+    if cached is not None:
+        return safe_jsonify({"ok": True, "found": True, "result": cached["data"], "saved_at": cached["saved_at"]})
+    persistent = _psx_persistent_result()
+    if persistent:
+        return safe_jsonify({"ok": True, "found": True, "result": persistent.get("result", persistent), "saved_at": persistent.get("saved_at")})
+    return safe_jsonify({"ok": True, "found": False})
 
 
 # =====================================================================
