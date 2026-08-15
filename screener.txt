@@ -1,0 +1,260 @@
+"""
+PSX Screener: 52-Week Low + RSI Bullish Divergence
+====================================================
+
+What this does
+---------------
+1. Downloads the list of all stocks listed on the Pakistan Stock Exchange (PSX).
+2. Pulls ~1 year of daily price history for each stock (free, public data via
+   the `psxdata` library).
+3. Flags stocks currently trading at or very near their 52-week low.
+4. Among those, checks for a classic "bullish RSI divergence":
+      -> price makes a LOWER low
+      -> but RSI(14) makes a HIGHER low at the same time
+   This pattern often signals weakening downside momentum.
+5. Writes the results to:
+      - results.html   (open this in your browser - just double-click it)
+      - results.csv     (open in Excel if you prefer)
+
+How to run it (see README.md for full step-by-step instructions)
+------------------------------------------------------------------
+    pip install -r requirements.txt
+    python psx_screener.py
+
+You can tweak the settings in the CONFIG section below without touching any
+other code.
+
+IMPORTANT DISCLAIMER
+---------------------
+This is a technical screening tool, not investment advice. 52-week-low +
+RSI-divergence is a starting point for further research, not a buy signal.
+Always do your own due diligence before trading. PSX market data terms
+restrict commercial redistribution of this data - this tool is intended for
+your own personal, non-commercial research use only.
+"""
+
+import sys
+import time
+import warnings
+from datetime import date, timedelta
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ============================== CONFIG ==================================
+
+# How many calendar days of history to pull (52 weeks + a buffer for
+# indicator "warm-up" and swing detection).
+HISTORY_DAYS = 420
+
+# Which price to use for the "52-week low" and swing-low calculations:
+#   "close" -> uses daily closing prices (matches simple "closing price
+#              near its 52-week-low-close" screens - broader, catches more
+#              stocks, but ignores intraday wicks/spikes)
+#   "low"   -> uses the actual intraday low (the candle wick) - matches how
+#              most charting platforms (e.g. TradingView) define "52-week
+#              low," but is stricter and will flag fewer stocks
+PRICE_BASIS = "close"
+
+# A stock is considered "near its 52-week low" if the latest close is within
+# this percentage of the 52-week low (as defined by PRICE_BASIS above).
+# 0 = only flag stocks making a brand-new 52-week low today.
+NEAR_LOW_PCT = 3.0
+
+# RSI settings
+RSI_PERIOD = 14
+
+# How many bars on either side a point needs to be the smallest/largest
+# in order to count as a "swing low" / "swing high" (for divergence
+# detection). Higher = fewer, more significant swings.
+SWING_ORDER = 5
+
+# Only look for divergence using swing lows that occurred within the last
+# N trading days (keeps it focused on the recent price action).
+DIVERGENCE_LOOKBACK_DAYS = 120
+
+# --- Significance filters (avoid flagging noisy, meaningless "divergences") ---
+# The 2nd low must be at least this % BELOW the 1st low to count as a real
+# "lower low" (not just a fraction of a percent of noise).
+MIN_PRICE_DROP_PCT = 0.25
+
+# RSI at the 2nd low must be at least this many points HIGHER than at the
+# 1st low to count as a real "higher low".
+MIN_RSI_RISE_POINTS = 2.0
+
+# --- Bearish divergence significance filters (mirror image of above) ---
+# The 2nd high must be at least this % ABOVE the 1st high to count as a
+# real "higher high".
+MIN_PRICE_RISE_PCT = 0.25
+
+# RSI at the 2nd high must be at least this many points LOWER than at the
+# 1st high to count as a real "lower high".
+MIN_RSI_DROP_POINTS = 2.0
+
+# --- Trend structure classification (higher-high/higher-low vs
+# lower-high/lower-low) ---
+# How many trading days back to look when classifying a stock's overall
+# structure as an uptrend or downtrend.
+STRUCTURE_LOOKBACK_DAYS = 180
+
+# Swing significance for structure classification (separate from the
+# divergence swing detection above, since structure is usually judged
+# over a longer window with bigger swings).
+STRUCTURE_SWING_ORDER = 5
+
+# Skip stocks with fewer than this many closing prices with real trading
+# (avoids illiquid / recently-listed / suspended scrips producing noise).
+MIN_TRADING_DAYS = 100
+
+# Skip stocks whose latest close is below this price (optional penny-stock
+# filter). Set to 0 to disable.
+MIN_PRICE = 0
+
+# Pause between requests to be polite to PSX's servers (seconds).
+REQUEST_DELAY = 0.15
+
+# Limit for testing - set to None to scan the FULL market (~700+ symbols,
+# takes a while on first run but is cached afterwards). Set to e.g. 30 to
+# do a quick test run first.
+LIMIT_SYMBOLS = None
+
+# ==========================================================================
+
+
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Standard Wilder RSI."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.fillna(50)  # neutral where undefined (e.g. no losses yet)
+    return rsi
+
+
+def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Standard MACD: MACD line = EMA(fast) - EMA(slow); Signal = EMA(signal)
+    of the MACD line; Histogram = MACD - Signal. Returns three Series."""
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+
+def compute_sma(close: pd.Series, period: int) -> pd.Series:
+    return close.rolling(window=period, min_periods=period).mean()
+
+
+def compute_ema(close: pd.Series, period: int) -> pd.Series:
+    return close.ewm(span=period, adjust=False).mean()
+
+
+def compute_classic_pivots(high: float, low: float, close: float) -> dict:
+    """Classic floor-trader pivot points, based on the most recent
+    completed session's High/Low/Close."""
+    p = (high + low + close) / 3
+    r1 = 2 * p - low
+    s1 = 2 * p - high
+    r2 = p + (high - low)
+    s2 = p - (high - low)
+    r3 = high + 2 * (p - low)
+    s3 = low - 2 * (high - p)
+    return {"P": p, "R1": r1, "R2": r2, "R3": r3, "S1": s1, "S2": s2, "S3": s3}
+
+
+def compute_fibonacci_pivots(high: float, low: float, close: float) -> dict:
+    """Fibonacci-ratio pivot points (0.382/0.618/1.0 of the day's range),
+    based on the most recent completed session's High/Low/Close."""
+    p = (high + low + close) / 3
+    rng = high - low
+    r1 = p + 0.382 * rng
+    s1 = p - 0.382 * rng
+    r2 = p + 0.618 * rng
+    s2 = p - 0.618 * rng
+    r3 = p + 1.000 * rng
+    s3 = p - 1.000 * rng
+    return {"P": p, "R1": r1, "R2": r2, "R3": r3, "S1": s1, "S2": s2, "S3": s3}
+
+
+def compute_technical_verdict(df: pd.DataFrame) -> dict:
+    """
+    Combines RSI(14), MACD(12,26,9), SMA 20/50/200, and EMA 20/50/200 into
+    a single weighted 0-100 score and a Strong Sell -> Strong Buy verdict.
+
+    Each of the 8 indicators casts one vote: Bullish (+1), Neutral (0), or
+    Bearish (-1). The score is the average vote rescaled to 0-100
+    (50 = perfectly neutral). This is a transparent, evenly-weighted
+    combination - not a proprietary or "official" formula - and the full
+    per-indicator breakdown is returned so exactly how the score was
+    reached is visible, not just the final number.
+
+    Requires df with a 'close' column (and enough history - 200+ bars
+    ideally, for the 200-period moving averages to be meaningful).
+    """
+    close = df["close"]
+    latest_close = float(close.iloc[-1])
+
+    breakdown = []
+
+    # --- RSI ---
+    rsi = compute_rsi(close, 14)
+    latest_rsi = float(rsi.iloc[-1])
+    if latest_rsi < 30:
+        rsi_signal = "bullish"   # oversold - potential bounce
+    elif latest_rsi > 70:
+        rsi_signal = "bearish"   # overbought - potential pullback
+    else:
+        rsi_signal = "neutral"
+    breakdown.append({"indicator": "RSI (14)", "value": round(latest_rsi, 2), "signal": rsi_signal})
+
+    # --- MACD ---
+    macd_line, signal_line, _ = compute_macd(close)
+    latest_macd, latest_signal = float(macd_line.iloc[-1]), float(signal_line.iloc[-1])
+    if latest_macd > latest_signal:
+        macd_signal = "bullish"
+    elif latest_macd < latest_signal:
+        macd_signal = "bearish"
+    else:
+        macd_signal = "neutral"
+    breakdown.append({
+        "indicator": "MACD (12,26,9)",
+        "value": f"MACD {latest_macd:.2f} vs Signal {latest_signal:.2f}",
+        "signal": macd_signal,
+    })
+
+    # --- SMA & EMA at 20/50/200 ---
+    for period in (20, 50, 200):
+        sma = compute_sma(close, period)
+        latest_sma = sma.iloc[-1]
+        if pd.notna(latest_sma):
+            sig = "bullish" if latest_close > latest_sma else ("bearish" if latest_close < latest_sma else "neutral")
+            breakdown.append({"indicator": f"SMA {period}", "value": round(float(latest_sma), 2), "signal": sig})
+        else:
+            breakdown.append({"indicator": f"SMA {period}", "value": None,
+                               "signal": "neutral", "note": f"Not enough history for a {period}-period SMA yet."})
+
+        ema = compute_ema(close, period)
+        latest_ema = float(ema.iloc[-1])
+        sig = "bullish" if latest_close > latest_ema else ("bearish" if latest_close < latest_ema else "neutral")
+        breakdown.append({"indicator": f"EMA {period}", "value": round(latest_ema, 2), "signal": sig})
+
+    vote_value = {"bullish": 1, "neutral": 0, "bearish": -1}
+    total_vote = sum(vote_value[b["signal"]] for b in breakdown)
+    score = round(50 + (total_vote / len(breakdown)) * 50, 1)
+
+    if score < 20:
+        verdict = "Strong Sell"
+    elif score < 40:
+        verdict = "Sell"
+    elif score < 60:
+        verdict = "Neutral"
+    elif score < 80:
+        verdict = "Buy"

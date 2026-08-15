@@ -29,6 +29,10 @@ def write_job(payload):
 
 
 def save_result(result):
+    # Persist to SQLite as well as the job JSON. SQLite survives a Gunicorn
+    # process restart, so the last completed full-market result is available
+    # immediately after a Render wake-up instead of forcing a new 555-symbol scan.
+    app._psx_save_persistent_result(result)
     payload = {"result": app._clean_for_json(result), "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     tmp = RESULT_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")

@@ -1,0 +1,301 @@
+
+# =====================================================================
+# PSX DIVERGENCE SCREENER — 52-week low + RSI divergence, market-wide
+# (merged in from the PSX Toolkit's original psx_screener.py / main())
+# =====================================================================
+# This is PSX Toolkit's own signature screen, distinct from the
+# filter-based "Screener" tab above: it walks every PSX-listed symbol's
+# ~1 year of daily price history (via the free `psxdata` library),
+# flags stocks near their 52-week low, and checks every stock market-wide
+# for bullish/bearish RSI divergence and trend structure. ~700+ symbols
+# with a polite delay between requests takes several minutes, so it runs
+# as a background job exactly like the Forex/Crypto Technicals scanners,
+# with progress polling and a cached "last run" result.
+
+PSX_DIVERGENCE_NEAR_LOW_PCT = getattr(core, "NEAR_LOW_PCT", 3.0)
+PSX_DIVERGENCE_LOOKBACK_DAYS = getattr(core, "DIVERGENCE_LOOKBACK_DAYS", 90)
+PSX_DIVERGENCE_SWING_ORDER = getattr(core, "SWING_ORDER", 5)
+PSX_STRUCTURE_LOOKBACK_DAYS = getattr(core, "STRUCTURE_LOOKBACK_DAYS", 180)
+PSX_STRUCTURE_SWING_ORDER = getattr(core, "STRUCTURE_SWING_ORDER", 5)
+PSX_DIVERGENCE_HISTORY_DAYS = getattr(core, "HISTORY_DAYS", 420)
+PSX_DIVERGENCE_MIN_TRADING_DAYS = getattr(core, "MIN_TRADING_DAYS", 100)
+PSX_DIVERGENCE_PRICE_BASIS = getattr(core, "PRICE_BASIS", "close")
+PSX_DIVERGENCE_REQUEST_DELAY = getattr(core, "REQUEST_DELAY", 0.15)
+PSX_HISTORICAL_URL = "https://dps.psx.com.pk/historical"
+PSX_HISTORY_COLUMN_MAP = {
+    "DATE": "date", "OPEN": "open", "HIGH": "high", "LOW": "low",
+    "CLOSE": "close", "VOLUME": "volume",
+}
+
+
+def fetch_psx_scraper_history(symbol):
+    response = _http_session.get(
+        f"{PSX_SCRAPER_API_BASE}/stocks/{symbol.upper()}/history",
+        params={"period": "5y", "interval": "daily"},
+        headers={"Accept": "application/json", "User-Agent": HEADERS["User-Agent"]},
+        timeout=20,
+    )
+    response.raise_for_status()
+    body = response.json()
+    data = body.get("data", body) if isinstance(body, dict) else body
+    if isinstance(data, dict):
+        data = data.get("candles") or data.get("history") or data.get("rows") or []
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("PSX scraper returned no historical candles")
+    rows = []
+    for row in data:
+        if isinstance(row, dict):
+            rows.append({"date": row.get("date") or row.get("day") or row.get("time"),
+                         "open": row.get("open"), "high": row.get("high"),
+                         "low": row.get("low"), "close": row.get("close"),
+                         "volume": row.get("volume")})
+    df = pd.DataFrame(rows)
+    if df.empty or "date" not in df or "close" not in df:
+        raise RuntimeError("PSX scraper history has no usable OHLCV columns")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", dayfirst=True)
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    if len(df) < 5:
+        raise RuntimeError("PSX scraper history has too few candles")
+    return df
+
+
+def _sanitize_ohlcv(df):
+    """Reject/fix malformed OHLC rows that can create huge vertical candle
+    wicks (e.g. a zero LOW/HIGH from a broken upstream feed). A valid candle
+    must contain positive prices and satisfy low <= open/close <= high. When
+    an upstream provider supplies an invalid high/low but valid open/close,
+    clamp the extrema to the actual candle body rather than drawing a wick to
+    zero or another impossible level."""
+    if df is None or df.empty:
+        return df
+    df=df.copy()
+    for c in ("open","high","low","close","volume"):
+        if c not in df.columns: df[c]=None
+        df[c]=pd.to_numeric(df[c],errors="coerce")
+    for i,row in df.iterrows():
+        c=row["close"]
+        o=row["open"] if pd.notna(row["open"]) else c
+        h=row["high"] if pd.notna(row["high"]) else max(o,c)
+        l=row["low"] if pd.notna(row["low"]) else min(o,c)
+        if any(pd.isna(x) for x in (o,c)) or c<=0 or o<=0:
+            df.at[i,"open"]=None; df.at[i,"high"]=None; df.at[i,"low"]=None; continue
+        body_hi=max(o,c); body_lo=min(o,c)
+        if h<=0 or h<body_hi or h>body_hi*5:
+            h=body_hi
+        if l<=0 or l>body_lo or l<body_lo/5:
+            l=body_lo
+        if h<l: h,l=body_hi,body_lo
+        df.at[i,"open"]=o; df.at[i,"high"]=h; df.at[i,"low"]=l; df.at[i,"close"]=c
+    df=df.dropna(subset=["open","high","low","close"])
+    return df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+
+
+def fetch_yahoo_psx_intraday(symbol, interval="5m", period="1d"):
+    """Fetch real intraday OHLCV for a PSX .KA symbol when Yahoo exposes it.
+    Yahoo imposes short retention windows on small intervals, so callers pass
+    an interval/period pair that respects those limits.  This is deliberately
+    a separate provider path from daily history: a failure here never causes
+    the reliable daily chart to be replaced by development data."""
+    symbol = symbol.upper().strip()
+    allowed = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
+    if interval not in allowed:
+        raise ValueError(f"Unsupported intraday interval: {interval}")
+    if interval == "1h":
+        interval = "60m"
+    response = _http_session.get(
+        YAHOO_CHART_URL.format(symbol=symbol),
+        params={"range": period, "interval": interval, "events": "div,splits", "includeAdjustedClose": "false"},
+        headers={**HEADERS, "Accept": "application/json,text/plain,*/*"}, timeout=12,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    chart = payload.get("chart") or {}
+    if chart.get("error"):
+        raise RuntimeError(str(chart["error"].get("description") or chart["error"]))
+    result = (chart.get("result") or [None])[0]
+    if not result:
+        raise RuntimeError("Yahoo returned no intraday chart result")
+    ts = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [None])[0] or {}
+    if not ts or not quote:
+        raise RuntimeError("Yahoo returned no intraday OHLCV")
+    df = pd.DataFrame({
+        "date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
+        "open": quote.get("open", []), "high": quote.get("high", []),
+        "low": quote.get("low", []), "close": quote.get("close", []),
+        "volume": quote.get("volume", []),
+    })
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df = _sanitize_ohlcv(df)
+    if len(df) < 5:
+        raise RuntimeError("Yahoo returned too few valid intraday candles")
+    return df
+
+
+def fetch_yahoo_psx_history(symbol, period="max"):
+    symbol = symbol.upper().strip()
+    if not re.match(r"^[A-Z0-9&.\-]{1,30}$", symbol):
+        raise ValueError(f"Invalid PSX symbol: {symbol!r}")
+    response = _http_session.get(
+        YAHOO_CHART_URL.format(symbol=symbol),
+        params={"range": period, "interval": "1d", "events": "div,splits", "includeAdjustedClose": "true"},
+        headers={**HEADERS, "Accept": "application/json,text/plain,*/*"}, timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    chart = payload.get("chart") or {}
+    if chart.get("error"):
+        raise RuntimeError(str(chart["error"].get("description") or chart["error"]))
+    result = (chart.get("result") or [None])[0]
+    if not result:
+        raise RuntimeError("Yahoo returned no chart result")
+    ts = result.get("timestamp") or []
+    quote = ((result.get("indicators") or {}).get("quote") or [None])[0] or {}
+    if not ts or not quote:
+        raise RuntimeError("Yahoo returned no OHLCV history")
+    df = pd.DataFrame({"date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
+                       "open": quote.get("open", []), "high": quote.get("high", []),
+                       "low": quote.get("low", []), "close": quote.get("close", []),
+                       "volume": quote.get("volume", [])})
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df=_sanitize_ohlcv(df)
+    if len(df) < 5:
+        raise RuntimeError("Yahoo returned too few valid OHLCV candles")
+    return df
+
+
+def _parse_history_html(html):
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if table is None:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    header_cells = table.find_all("th")
+    headers = [th.get_text(" ", strip=True).upper() for th in header_cells]
+    if not headers:
+        first = table.find("tr")
+        headers = [c.get_text(" ", strip=True).upper() for c in first.find_all(["td", "th"])] if first else []
+    col_index = {}
+    for i, h in enumerate(headers):
+        key = PSX_HISTORY_COLUMN_MAP.get(h)
+        if key and key not in col_index:
+            col_index[key] = i
+    if "date" not in col_index or "close" not in col_index:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    rows=[]
+    for tr in table.find_all("tr"):
+        cells=tr.find_all("td")
+        if len(cells) <= max(col_index.values()): continue
+        texts=[c.get_text(" ", strip=True) for c in cells]
+        close=_number(texts[col_index["close"]])
+        if not texts[col_index["date"]] or close is None: continue
+        rows.append({"date":texts[col_index["date"]], "open":_number(texts[col_index["open"]]) if "open" in col_index else None,
+                     "high":_number(texts[col_index["high"]]) if "high" in col_index else None, "low":_number(texts[col_index["low"]]) if "low" in col_index else None,
+                     "close":close, "volume":_number(texts[col_index["volume"]]) if "volume" in col_index else None})
+    if not rows: return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    df=pd.DataFrame(rows)
+    raw=df["date"].astype(str).str.strip()
+    parsed=pd.to_datetime(raw, format="%d-%m-%Y", errors="coerce")
+    mask=parsed.isna()
+    if mask.any(): parsed.loc[mask]=pd.to_datetime(raw[mask], format="%Y-%m-%d", errors="coerce")
+    mask=parsed.isna()
+    if mask.any(): parsed.loc[mask]=pd.to_datetime(raw[mask], errors="coerce", dayfirst=True)
+    df["date"]=parsed
+    for c in ("open","high","low","close","volume"): df[c]=pd.to_numeric(df[c], errors="coerce")
+    df=df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    return _sanitize_ohlcv(df)
+
+
+def fetch_psx_history_direct(symbol, max_retries=2, retry_delays=(1, 2)):
+    """Real PSX-listed daily OHLCV provider chain.
+
+    The old code POSTed only ``symbol`` to /historical. The current PSX portal
+    expects month/year/symbol; that invalid request is what caused the
+    production ``The string did not match the expected pattern`` error.
+    """
+    symbol=symbol.upper().strip()
+    errors=[]
+    for label, fn in (("PSX scraper API", lambda: fetch_psx_scraper_history(symbol)),
+                      ("Yahoo .KA", lambda: fetch_yahoo_psx_history(symbol, "max"))):
+        try:
+            df=fn()
+            if df is not None and len(df)>=5: return df
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    # Correct PSX fallback: one month per request, with the parameters the
+    # historical endpoint actually requires. This path is intentionally last
+    # because Yahoo/PSX-scraper return multi-year history in one call.
+    today=date.today(); y,m=today.year,today.month; pieces=[]
+    for _ in range(15):
+        for base_url in (PSX_HISTORICAL_URL, f"{PSX_ALT_BASE}/historical"):
+            try:
+                resp=_http_session.post(base_url, data={"month":m,"year":y,"symbol":symbol}, headers={**HEADERS,"Accept":"text/html, */*;q=0.01","Content-Type":"application/x-www-form-urlencoded; charset=UTF-8"}, timeout=12)
+                resp.raise_for_status(); part=_parse_history_html(resp.text)
+                if not part.empty: pieces.append(part)
+                break
+            except Exception as exc:
+                errors.append(f"PSX {y}-{m:02d}: {exc}")
+        m-=1
+        if m==0: y-=1; m=12
+    if pieces:
+        df=pd.concat(pieces, ignore_index=True).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+        if len(df)>=5: return df
+    raise RuntimeError(f"No real historical OHLCV available for {symbol}. Providers tried: {' | '.join(errors[-4:])}")
+
+def compute_multi_timeframe_divergence(full_df, daily_df):
+    """Compute independent 1D/1W/1M divergence + local structure.
+
+    Each timeframe is analysed on its own bars. A valid divergence is no
+    longer hidden by a later non-divergent pivot, and structure is evaluated
+    on the same timeframe rather than borrowing the latest daily structure.
+    """
+    out = {"div_1d": None, "div_1w": None, "div_1m": None}
+    tf_specs = [
+        ("div_1d", daily_df, None, PSX_DIVERGENCE_LOOKBACK_DAYS, PSX_DIVERGENCE_SWING_ORDER, PSX_DIVERGENCE_MIN_TRADING_DAYS),
+        ("div_1w", full_df, "W", 52, 4, 20),
+        ("div_1m", full_df, "M", 24, 3, 12),
+    ]
+    for key, src_df, rule, lookback, swing_order, min_bars in tf_specs:
+        try:
+            tf_df = src_df if rule is None else resample_ohlc(src_df, rule)
+            if tf_df is None or len(tf_df) < min_bars:
+                continue
+            tf_df = tf_df.copy()
+            tf_df["date"] = pd.to_datetime(tf_df["date"])
+            tf_df["rsi"] = core.compute_rsi(tf_df["close"], core.RSI_PERIOD)
+            lookback = min(lookback, len(tf_df) - 1)
+            bullish = core.check_bullish_divergence(tf_df, lookback, swing_order)
+            bearish = core.check_bearish_divergence(tf_df, lookback, swing_order)
+            structure = core.classify_structure(tf_df, min(len(tf_df), 60), max(3, swing_order))
+            hit = bullish or bearish
+            if hit:
+                out[key] = {"type": "bullish" if bullish else "bearish", **hit, "structure": structure or "mixed"}
+        except Exception:
+            pass
+    return out
+
+def _latest_heikin_ashi(df):
+    """Return the latest true Heikin-Ashi OHLC values using the standard
+    recursive HA-open formula, not a body-only approximation."""
+    if df is None or df.empty:
+        return None
+    ha_open=None; last=None
+    for row in df.sort_values("date").itertuples(index=False):
+        o,h,l,c=float(row.open),float(row.high),float(row.low),float(row.close)
+        ha_close=(o+h+l+c)/4.0
+        if ha_open is None:
+            ha_open=(o+c)/2.0
+        else:
+            ha_open=(ha_open+last)/2.0
+        ha_high=max(h,ha_open,ha_close)
+        ha_low=min(l,ha_open,ha_close)
+        last=ha_close
+    return {"open":ha_open,"close":last,"high":ha_high,"low":ha_low,"color":"green" if last>=ha_open else "red"}
+
+

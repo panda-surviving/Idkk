@@ -11,16 +11,16 @@ def test_chart_ranges_are_true_ranges():
     app = read("app.py")
     js = read("static/app.js")
     html = read("templates/index.html")
-    assert '"1H": {"intraday_interval": "1h"' in app
-    assert '"5H": {"intraday_interval": "1h"' in app
-    assert '"1D": {"daily_period": "3mo"' in app
-    assert '"5D": {"daily_period": "3mo"' in app
-    assert '"candle_interval": "1h"' in app
-    assert '"candle_interval": "1d"' in app
+    assert '"1H": {"kind": "intraday"' in app
+    assert '"5H": {"kind": "intraday"' in app
+    assert '"1D": {"kind": "daily"' in app
+    assert '"5D": {"kind": "daily"' in app
+    assert '"candle_interval": "5h" if cfg.get("aggregate_hours") else "1h"' in app
+    assert 'cfg["label"].split("·", 1)' in app
     assert 'data-tf="5H"' in html
-    assert 'range_hours' in app
-    assert 'range_hours' in app
-    assert 'one-hour candles' in app
+    assert 'display_days' in app
+    assert 'aggregate_hours' in app
+    assert 'genuine hourly OHLCV' in app
     assert 'd.timeframe || currentChartTimeframe' in js
     assert 'd.candle_interval' in js
 

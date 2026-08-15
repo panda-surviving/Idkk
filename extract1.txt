@@ -1,0 +1,651 @@
+def compute_premarket_signal():
+    """Pre-market read: flags when more of the tracked global
+    markets/commodities are trading down than up, ahead of PSX's own
+    open. Uses live vendor data when MARKET_DATA_API_KEY is set
+    (get_multi_market_live), and falls back to the MULTI_MARKET
+    development snapshot otherwise."""
+    markets = get_multi_market_live()
+    global_markets = [m for m in markets if m["key"] != "kse100"]
+    down = [m for m in global_markets if m.get("tone") == "down"]
+    up = [m for m in global_markets if m.get("tone") == "up"]
+
+    return {
+        "alert": len(down) > len(up),
+        "down_count": len(down),
+        "up_count": len(up),
+        "down_markets": [m["name"] for m in down],
+        "live": bool(MARKET_DATA_API_KEY),
+        "note": (
+            "Live vendor data." if MARKET_DATA_API_KEY else
+            "Development signal from the Markets snapshot data. Set MARKET_DATA_API_KEY for a live pre-open feed."
+        ),
+    }
+
+
+def db():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+
+    return conn
+
+
+def init_db():
+    conn = db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS holdings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL UNIQUE,
+        quantity REAL NOT NULL,
+        avg_cost REAL NOT NULL,
+        acquired_date TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        type TEXT NOT NULL,
+        quantity REAL NOT NULL,
+        price REAL NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS watchlist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL UNIQUE
+    );
+
+    CREATE TABLE IF NOT EXISTS portfolio_daily (
+        day TEXT PRIMARY KEY,
+        invested REAL NOT NULL,
+        value REAL NOT NULL,
+        pnl REAL NOT NULL,
+        pnl_pct REAL NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS holding_daily (
+        day TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        price REAL NOT NULL,
+        quantity REAL NOT NULL,
+        avg_cost REAL NOT NULL,
+        invested REAL NOT NULL,
+        value REAL NOT NULL,
+        pnl REAL NOT NULL,
+        pnl_pct REAL NOT NULL,
+        PRIMARY KEY(day, symbol)
+    );
+
+    CREATE TABLE IF NOT EXISTS stock_price_history (
+        day TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        close REAL,
+        high REAL,
+        low REAL,
+        volume REAL,
+        PRIMARY KEY(day, symbol)
+    );
+
+    CREATE TABLE IF NOT EXISTS fund_nav_history (
+        day TEXT NOT NULL,
+        fund_name TEXT NOT NULL,
+        nav REAL,
+        PRIMARY KEY(day, fund_name)
+    );
+    """)
+
+    # Upgrade older database: add sort_order to holdings/watchlist if missing.
+    holdings_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(holdings)").fetchall()
+    }
+    if "sort_order" not in holdings_columns:
+        conn.execute("ALTER TABLE holdings ADD COLUMN sort_order INTEGER DEFAULT 0")
+        conn.execute(
+            "UPDATE holdings SET sort_order = id WHERE sort_order IS NULL OR sort_order = 0"
+        )
+
+    watchlist_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(watchlist)").fetchall()
+    }
+    if "sort_order" not in watchlist_columns:
+        conn.execute("ALTER TABLE watchlist ADD COLUMN sort_order INTEGER DEFAULT 0")
+        conn.execute(
+            "UPDATE watchlist SET sort_order = id WHERE sort_order IS NULL OR sort_order = 0"
+        )
+    if "asset_type" not in watchlist_columns:
+        # asset_type: 'stock' (default, uses live get_quote), 'crypto',
+        # 'forex', or 'fund'. For non-stock types we can't call
+        # get_quote (that's PSX-specific), so we store a display name
+        # and a last-seen price/change snapshot at the time it was
+        # added, refreshed opportunistically from the live endpoints.
+        conn.execute("ALTER TABLE watchlist ADD COLUMN asset_type TEXT DEFAULT 'stock'")
+        conn.execute("ALTER TABLE watchlist ADD COLUMN display_name TEXT")
+        conn.execute("ALTER TABLE watchlist ADD COLUMN last_price REAL")
+        conn.execute("ALTER TABLE watchlist ADD COLUMN last_change_pct REAL")
+
+    # Upgrade older database if acquired_date does not exist.
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(holdings)").fetchall()
+    }
+    if "acquired_date" not in columns:
+        conn.execute("ALTER TABLE holdings ADD COLUMN acquired_date TEXT")
+
+    if conn.execute("SELECT COUNT(*) FROM holdings").fetchone()[0] == 0:
+        today = date.today().isoformat()
+        conn.executemany(
+            """
+            INSERT INTO holdings(symbol,quantity,avg_cost,acquired_date)
+            VALUES(?,?,?,?)
+            """,
+            [
+                ("FFC", 700, 350, today),
+                ("UBL", 450, 310, today),
+                ("OGDC", 800, 190, today),
+                ("MARI", 250, 590, today),
+                ("HBL", 500, 155, today),
+                ("EFERT", 350, 170, today),
+            ]
+        )
+
+    if conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 0:
+        conn.executemany(
+            "INSERT INTO watchlist(symbol) VALUES(?)",
+            [("LUCK",), ("SYS",), ("PPL",), ("MCB",)]
+        )
+
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------
+# PSX symbol directory
+# ---------------------------------------------------------
+
+def _parse_eligible_scrips_html(html):
+    """Parse only the Regular Deliverable Equity Market from PSX's official
+    Eligible Scrips page.  Never mix futures/bonds/rights-contract tables into
+    the equity universe used by the stock directory or technical screener."""
+    soup = BeautifulSoup(html, "html.parser")
+    tables = soup.find_all("table")
+    candidates = []
+    for table in tables:
+        rows = table.find_all("tr")
+        parsed = []
+        for row in rows:
+            cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+            if len(cells) < 2:
+                continue
+            symbol, company = cells[0].strip().upper(), cells[1].strip()
+            if symbol in {"SYMBOL", "NAME"}:
+                continue
+            if not re.match(r"^[A-Z0-9&.\-]{1,30}$", symbol):
+                continue
+            # Exclude contract-style symbols and non-equity instruments.
+            if any(x in symbol for x in ("-JUL", "-AUG", "-SEP", "TFC", "SC", "-C")):
+                continue
+            parsed.append({"symbol": symbol, "company": company, "sector": ""})
+        if len(parsed) >= 100:
+            candidates = parsed
+            break
+    if not candidates:
+        raise RuntimeError("PSX Eligible Scrips page did not expose a complete regular-equity table")
+    seen=set(); out=[]
+    for row in candidates:
+        if row["symbol"] not in seen:
+            seen.add(row["symbol"]); out.append(row)
+    out.sort(key=lambda x:x["symbol"])
+    return out
+
+
+def fetch_psx_symbols(force=False):
+    now = datetime.now()
+    with _symbol_lock:
+        if (not force and _symbol_cache["items"] and _symbol_cache["time"]
+                and now - _symbol_cache["time"] < timedelta(minutes=SYMBOL_CACHE_MINUTES)):
+            return _symbol_cache["items"]
+
+    errors=[]
+    # IMPORTANT: the official Eligible Scrips page is authoritative for the
+    # complete regular equity universe.  The /symbols endpoint can be a small
+    # development/quote directory on some PSX deployments, so it is never
+    # accepted as the complete universe unless it contains a large directory.
+    try:
+        r=_http_session.get(PSX_ALT_ELIGIBLE_URL, headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        items=_parse_eligible_scrips_html(r.text)
+        if len(items) >= MIN_COMPLETE_PSX_SYMBOLS:
+            with _symbol_lock:
+                _symbol_cache.update({"items":items,"time":now})
+            return items
+    except Exception as exc:
+        errors.append(f"eligible: {exc}")
+
+    # Official primary PSX hostname as a second attempt.
+    try:
+        r=_http_session.get("https://dps.psx.com.pk/eligible-scrips", headers=HEADERS, timeout=20)
+        r.raise_for_status()
+        items=_parse_eligible_scrips_html(r.text)
+        if len(items) >= MIN_COMPLETE_PSX_SYMBOLS:
+            with _symbol_lock:
+                _symbol_cache.update({"items":items,"time":now})
+            return items
+    except Exception as exc:
+        errors.append(f"primary eligible: {exc}")
+
+    # JSON symbol directories are accepted only when they are demonstrably
+    # complete (400+ entries), otherwise they are treated as a partial feed.
+    for url in (PSX_SYMBOLS_URL, PSX_ALT_SYMBOLS_URL):
+        try:
+            r=_http_session.get(url, headers=HEADERS, timeout=15)
+            r.raise_for_status(); raw=r.json()
+            items=[]; seen=set()
+            for row in raw if isinstance(raw,list) else []:
+                if row.get("isDebt") or row.get("isETF"):
+                    continue
+                symbol=str(row.get("symbol","")).strip().upper()
+                if not symbol or symbol in seen or not re.match(r"^[A-Z0-9&.\-]{1,30}$", symbol):
+                    continue
+                seen.add(symbol)
+                items.append({"symbol":symbol,"company":str(row.get("name","")).strip(),"sector":str(row.get("sectorName","")).strip()})
+            if len(items) >= MIN_COMPLETE_PSX_SYMBOLS:
+                items.sort(key=lambda x:x["symbol"])
+                with _symbol_lock:
+                    _symbol_cache.update({"items":items,"time":now})
+                return items
+            errors.append(f"{url}: only {len(items)} symbols")
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+
+    raise RuntimeError("Complete PSX equity universe unavailable; refusing to return the 10-symbol development fallback. " + " | ".join(errors[-3:]))
+
+
+def _fallback_symbol_directory():
+    # Kept only for legacy pages that explicitly request a development
+    # snapshot. It MUST NOT be used by All PSX Stocks or the PSX screener.
+    return [{"symbol": s, "company": q.get("company", s), "sector": q.get("sector", "")} for s, q in FALLBACK_QUOTES.items()]
+
+
+def get_symbols_nonblocking(force=False):
+    """Return a complete PSX equity directory, or a previously cached complete
+    directory.  A 10-symbol development snapshot is never presented as the
+    real PSX directory."""
+    now=datetime.now()
+    with _symbol_lock:
+        cached=list(_symbol_cache["items"])
+        cache_time=_symbol_cache["time"]
+    if cached and cache_time and now-cache_time < timedelta(minutes=SYMBOL_CACHE_MINUTES) and not force:
+        return cached, True
+    try:
+        items=fetch_psx_symbols(force=True)
+        return items, True
+    except Exception:
+        if cached:
+            threading.Thread(target=_background_refresh_symbols, daemon=True).start()
+            return cached, True
+        return [], False
+
+
+def _background_refresh_symbols():
+    try:
+        fetch_psx_symbols(force=True)
+    except Exception:
+        pass
+
+
+def symbol_metadata(symbol):
+    symbol = symbol.upper()
+    try:
+        for row in fetch_psx_symbols():
+            if row["symbol"] == symbol:
+                return row
+    except Exception:
+        pass
+    fallback = FALLBACK_QUOTES.get(symbol, {})
+    return {"symbol":symbol,"company":fallback.get("company",symbol),"sector":fallback.get("sector","")}
+
+# ---------------------------------------------------------
+# PSX company-page quote parser
+# ---------------------------------------------------------
+
+def _number(value):
+    if value is None:
+        return None
+    try:
+        n = float(str(value).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+    # float("nan")/float("inf") parse "successfully" in Python but are not
+    # valid JSON and would otherwise slip through into an API response.
+    if math.isnan(n) or math.isinf(n):
+        return None
+    return n
+
+
+def _downsample(values, target_len):
+    """Reduce a long series (e.g. CoinGecko's ~168 hourly 7d points) to
+    roughly target_len evenly-spaced points, for a lightweight sparkline
+    without shipping hundreds of points to the browser."""
+    values = [v for v in (values or []) if v is not None]
+    if len(values) <= target_len:
+        return values
+
+    step = len(values) / target_len
+    return [values[int(i * step)] for i in range(target_len)]
+
+
+def _integer(value):
+    if value is None:
+        return None
+    try:
+        return int(float(str(value).replace(",", "").strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def _search(text, pattern, flags=re.I):
+    match = re.search(pattern, text, flags)
+    return match.group(1).strip() if match else None
+
+
+def parse_company_page(symbol, html):
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    meta = symbol_metadata(symbol)
+
+    price_match = re.search(r'data-current="([\d,.]+)"', html, re.I)
+    price = _number(price_match.group(1)) if price_match else None
+
+    # Header commonly contains: Rs.221.55 -0.93 (-0.42%)
+    header = re.search(
+        r'Rs\.\s*([\d,.]+)\s+([+-]?\d[\d,.]*)\s+\(\s*([+-]?\d+(?:\.\d+)?)%\s*\)',
+        text,
+        re.I
+    )
+
+    change = None
+    change_pct = None
+    if header:
+        price = price or _number(header.group(1))
+        change = _number(header.group(2))
+        change_pct = _number(header.group(3))
+
+    quote = {
+        **meta,
+        "price": price,
+        "change": change,
+        "change_pct": change_pct,
+        "open": _number(_search(text, r'\bOpen\s*([\d,.]+)')),
+        "high": _number(_search(text, r'\bHigh\s*([\d,.]+)')),
+        "low": _number(_search(text, r'\bLow\s*([\d,.]+)')),
+        "volume": _integer(_search(text, r'\bVolume\s*([\d,]+)')),
+        "ldcp": _number(_search(text, r'\bLDCP\s*([\d,.]+)')),
+        "ask_price": _number(_search(text, r'\bAsk Price\s*([\d,.]+)')),
+        "ask_volume": _integer(_search(text, r'\bAsk Volume\s*([\d,]+)')),
+        "bid_price": _number(_search(text, r'\bBid Price\s*([\d,.]+)')),
+        "bid_volume": _integer(_search(text, r'\bBid Volume\s*([\d,]+)')),
+        "pe_ratio": _number(_search(text, r'P/E Ratio\s*\(TTM\)\s*([\d,.]+)')),
+        "one_year_change": _number(_search(text, r'1-Year Change[^0-9+\-]*([+\-]?\d+(?:\.\d+)?)%')),
+        "ytd_change": _number(_search(text, r'YTD Change[^0-9+\-]*([+\-]?\d+(?:\.\d+)?)%')),
+        "last_update": _search(text, r'Last update:\s*([^*]+?)(?=\s+Open\b|\s+Company Profile\b|$)'),
+        "eps_annual": None,
+        "eps_quarterly": [],
+        "dividend_yield_pct": None,
+        "book_value_per_share": None,
+        "price_to_book": None,
+        "market_cap": None,
+        "shares_outstanding": None,
+        "free_float_shares": None,
+        "free_float_pct": None,
+        "face_value": None,
+        "dividend_per_share": None,
+        "dividend_payout_pct": None,
+        "debt_to_equity": None,
+        "current_ratio": None,
+        "return_on_equity_pct": None,
+        "return_on_assets_pct": None,
+    }
+
+    # PSX company pages expose real financial tables. Extract the latest
+    # annual/quarterly EPS and any investment-ratio fields when present.
+    # These are source-backed values; we never manufacture missing fields.
+    def row_numbers(row):
+        cells = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["td", "th"])]
+        nums = []
+        for cell in cells[1:]:
+            m = re.search(r"([+\-]?\d+(?:,\d{3})*(?:\.\d+)?)", cell.replace(",", ""))
+            if m:
+                try:
+                    nums.append(float(m.group(1)))
+                except ValueError:
+                    pass
+        return cells, nums
+
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells, nums = row_numbers(row)
+            if not cells:
+                continue
+            label = cells[0].strip().lower()
+            if label in {"eps", "earnings per share", "earnings per share (eps)", "basic earnings per share (eps)"} and nums:
+                if quote["eps_annual"] is None:
+                    quote["eps_annual"] = nums[0]
+                elif not quote["eps_quarterly"]:
+                    quote["eps_quarterly"] = nums
+            elif "dividend yield" in label and nums and quote["dividend_yield_pct"] is None:
+                quote["dividend_yield_pct"] = nums[0]
+            elif ("break-up value" in label or "book value per share" in label or "breakup value" in label) and nums and quote["book_value_per_share"] is None:
+                quote["book_value_per_share"] = nums[0]
+            elif ("price to book" in label or "p/b" in label) and nums and quote["price_to_book"] is None:
+                quote["price_to_book"] = nums[0]
+            elif ("dividend per share" in label or "cash dividend per share" in label or label == "dividend") and nums and quote["dividend_per_share"] is None:
+                quote["dividend_per_share"] = nums[0]
+            elif ("dividend payout" in label or "payout ratio" in label) and nums and quote["dividend_payout_pct"] is None:
+                quote["dividend_payout_pct"] = nums[0]
+            elif ("debt to equity" in label or "debt/equity" in label or "d/e" in label) and nums and quote["debt_to_equity"] is None:
+                quote["debt_to_equity"] = nums[0]
+            elif "current ratio" in label and nums and quote["current_ratio"] is None:
+                quote["current_ratio"] = nums[0]
+            elif ("return on equity" in label or "roe" == label) and nums and quote["return_on_equity_pct"] is None:
+                quote["return_on_equity_pct"] = nums[0]
+            elif ("return on assets" in label or "roa" == label) and nums and quote["return_on_assets_pct"] is None:
+                quote["return_on_assets_pct"] = nums[0]
+
+    # Some PSX pages render ratios as plain label/value text instead of
+    # semantic table rows. These fallbacks only parse values that are actually
+    # printed by the source page; missing fields remain null.
+    def first_label_value(patterns):
+        for pat in patterns:
+            val = _number(_search(text, pat))
+            if val is not None:
+                return val
+        return None
+
+    if quote["book_value_per_share"] is None:
+        quote["book_value_per_share"] = first_label_value([
+            r'Break[\- ]?up Value(?:\s*/\s*Share)?\s*([\d,.]+)',
+            r'Book Value(?:\s*/\s*Share)?\s*([\d,.]+)',
+            r'Book Value Per Share\s*([\d,.]+)',
+        ])
+    if quote["price_to_book"] is None:
+        quote["price_to_book"] = first_label_value([r'Price\s*(?:/|to)\s*Book\s*([\d,.]+)', r'P\s*/\s*B\s*([\d,.]+)'])
+    if quote["dividend_yield_pct"] is None:
+        quote["dividend_yield_pct"] = first_label_value([r'Dividend Yield\s*([\d,.]+)\s*%?', r'Dividend Yield %\s*([\d,.]+)'])
+    if quote["dividend_per_share"] is None:
+        quote["dividend_per_share"] = first_label_value([r'Dividend Per Share\s*([\d,.]+)', r'Cash Dividend Per Share\s*([\d,.]+)'])
+    if quote["face_value"] is None:
+        quote["face_value"] = first_label_value([r'Face Value\s*([\d,.]+)'])
+    if quote["dividend_payout_pct"] is None:
+        quote["dividend_payout_pct"] = first_label_value([r'Dividend Payout(?: Ratio)?\s*([\d,.]+)\s*%?'])
+    if quote["debt_to_equity"] is None:
+        quote["debt_to_equity"] = first_label_value([r'Debt\s*(?:/|to)\s*Equity\s*([\d,.]+)'])
+    if quote["current_ratio"] is None:
+        quote["current_ratio"] = first_label_value([r'Current Ratio\s*([\d,.]+)'])
+    if quote["return_on_equity_pct"] is None:
+        quote["return_on_equity_pct"] = first_label_value([r'Return on Equity(?:\s*\(ROE\))?\s*([\d,.]+)\s*%?'])
+    if quote["return_on_assets_pct"] is None:
+        quote["return_on_assets_pct"] = first_label_value([r'Return on Assets(?:\s*\(ROA\))?\s*([\d,.]+)\s*%?'])
+
+    # Equity-profile values are usually rendered as label/value text rather
+    # than table rows.
+    quote["market_cap"] = _number(_search(text, r'Market Cap\s*\(000\'s\)\s*([\d,.]+)'))
+    quote["shares_outstanding"] = _integer(_search(text, r'\bShares\s*([\d,]+)'))
+    ff_match = re.search(r'Free Float\s*([\d,]+)\s*Free Float\s*([\d.]+)%', text, re.I)
+    if ff_match:
+        quote["free_float_shares"] = _integer(ff_match.group(1))
+        quote["free_float_pct"] = _number(ff_match.group(2))
+
+    day_range = re.search(
+        r'DAY RANGE\s*([\d,.]+)\s*[—-]\s*([\d,.]+)',
+        text,
+        re.I
+    )
+    if day_range:
+        quote["day_low"] = _number(day_range.group(1))
+        quote["day_high"] = _number(day_range.group(2))
+    else:
+        quote["day_low"] = quote["low"]
+        quote["day_high"] = quote["high"]
+
+    range52 = re.search(
+        r'52-WEEK RANGE[^\d]*([\d,.]+)\s*[—-]\s*([\d,.]+)',
+        text,
+        re.I
+    )
+    if range52:
+        quote["low52"] = _number(range52.group(1))
+        quote["high52"] = _number(range52.group(2))
+    else:
+        quote["low52"] = None
+        quote["high52"] = None
+
+    circuit = re.search(
+        r'CIRCUIT BREAKER\s*([\d,.]+)\s*[—-]\s*([\d,.]+)',
+        text,
+        re.I
+    )
+    if circuit:
+        quote["circuit_low"] = _number(circuit.group(1))
+        quote["circuit_high"] = _number(circuit.group(2))
+    else:
+        quote["circuit_low"] = None
+        quote["circuit_high"] = None
+
+    return quote
+
+
+def get_quote(symbol, force=False):
+    symbol = symbol.upper()
+    now = datetime.now()
+
+    with _quote_lock:
+        cached = _quote_cache.get(symbol)
+        if (
+            not force
+            and cached
+            and now - cached["time"] < timedelta(seconds=QUOTE_CACHE_SECONDS)
+        ):
+            return cached["quote"]
+
+    last_exc = None
+    for url in (PSX_COMPANY_URL.format(symbol=symbol), PSX_ALT_COMPANY_URL.format(symbol=symbol)):
+        try:
+            response = _http_session.get(url, headers=HEADERS, timeout=12)
+            response.raise_for_status()
+            quote = parse_company_page(symbol, response.text)
+
+            # Merge real market-wide fields whenever available. This fills
+            # screener-only metrics (30D volume, dividend yield, etc.) without
+            # replacing the richer company-page fields.
+            with _bulk_quote_lock:
+                bulk_match = next((q for q in _bulk_quote_cache["items"] if q.get("symbol") == symbol), None)
+            if bulk_match is not None:
+                for k in (
+                    "price", "change_pct", "volume", "pe_ratio", "dividend_yield",
+                    "volume_30d_avg", "one_year_change", "eps"
+                ):
+                    if quote.get(k) is None and bulk_match.get(k) is not None:
+                        quote[k] = bulk_match.get(k)
+                quote["source"] = quote.get("source") or bulk_match.get("source", "PSX official screener")
+            else:
+                quote["source"] = quote.get("source") or "PSX company page"
+
+            if quote.get("price") is None:
+                raise RuntimeError("PSX company page returned no usable price")
+
+            quote["source"] = quote.get("source") or "PSX company page"
+            quote["fetched_at"] = now.isoformat(timespec="seconds")
+
+            with _quote_lock:
+                _quote_cache[symbol] = {"time": now, "quote": quote}
+            return quote
+        except Exception as exc:
+            last_exc = exc
+
+    exc = last_exc or requests.RequestException("PSX company page unavailable")
+    return {
+        **symbol_metadata(symbol),
+        "price": None,
+        "volume": None,
+        "source": "Unavailable",
+        "error": str(exc),
+        "fetched_at": now.isoformat(timespec="seconds"),
+    }
+
+
+def record_daily_prices(quotes):
+    """Persist today's close/high/low/volume for every symbol in a bulk
+    fetch, so technical indicators (SMA, EMA, RSI, MACD, OBV) become
+    computable over time. This is the mechanism that "activates" those
+    screener filters — they start returning real matches once enough
+    trading days have been recorded (see compute_technicals below)."""
+    today = date.today().isoformat()
+    conn = db()
+
+    rows = [
+        (
+            today,
+            q.get("symbol"),
+            q.get("price"),
+            q.get("high"),
+            q.get("low"),
+            q.get("volume"),
+        )
+        for q in quotes
+        if q.get("symbol") and q.get("price") is not None
+    ]
+
+    conn.executemany(
+        """
+        INSERT INTO stock_price_history(day,symbol,close,high,low,volume)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(day,symbol) DO UPDATE SET
+            close=excluded.close,
+            high=excluded.high,
+            low=excluded.low,
+            volume=excluded.volume
+        """,
+        rows
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_price_history(symbol, limit=260):
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT day, close, high, low, volume
+        FROM stock_price_history
+        WHERE symbol = ?
+        ORDER BY day DESC
+        LIMIT ?
+        """,
+        (symbol.upper(), limit)
+    ).fetchall()
+    conn.close()
+
+    rows = [dict(r) for r in rows]
+    rows.reverse()  # oldest -> newest
+    return rows
+

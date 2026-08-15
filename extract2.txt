@@ -1,0 +1,351 @@
+            t = i / gap_days
+            value = start_value + (first_real_value - start_value) * t
+            invested = float(quantity) * float(avg_cost)
+            pnl = value - invested
+
+            estimated.append({
+                "day": day.isoformat(),
+                "price": (value / float(quantity)) if quantity else avg_cost,
+                "quantity": quantity,
+                "avg_cost": avg_cost,
+                "invested": invested,
+                "value": value,
+                "pnl": pnl,
+                "pnl_pct": (pnl / invested * 100) if invested else 0,
+                "estimated": True,
+            })
+
+    combined = estimated + [dict(r, estimated=False) for r in real]
+    combined.sort(key=lambda r: r["day"])
+
+    history = []
+    previous_pnl = None
+
+    for row in combined:
+        pnl = float(row["pnl"])
+        daily_change = 0.0 if previous_pnl is None else pnl - previous_pnl
+
+        history.append({
+            **row,
+            "daily_pnl_change": daily_change,
+        })
+
+        previous_pnl = pnl
+
+    return history
+
+
+# ---------------------------------------------------------
+# Routes
+# ---------------------------------------------------------
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.get("/api/symbols")
+def symbols():
+    items, warmed_up = get_symbols_nonblocking()
+    if not items:
+        return safe_jsonify({"count":0,"symbols":[],"warming_up":True,"updated_at":None,
+                              "error":"Complete PSX equity directory is temporarily unavailable; the 10-symbol development snapshot is intentionally not shown."}), 503
+    return safe_jsonify({
+        "count": len(items), "symbols": items, "warming_up": not warmed_up,
+        "updated_at": _symbol_cache["time"].isoformat(timespec="seconds") if _symbol_cache["time"] else None
+    })
+
+
+@app.post("/api/symbols/refresh")
+def refresh_symbols():
+    threading.Thread(target=_background_refresh_symbols, daemon=True).start()
+    return jsonify({"ok": True, "message": "Refresh started in the background."})
+
+
+@app.get("/api/stock/<symbol>")
+def stock_detail(symbol):
+    try:
+        quote = get_quote(symbol)
+    except Exception as exc:
+        quote = {"symbol":symbol.upper(), "price":None, "source":"Unavailable", "error":str(exc)}
+    try:
+        quote["series"] = get_intraday(symbol)
+    except Exception:
+        quote["series"] = []
+    # The intraday endpoint is optional. The interactive historical chart is
+    # the reliable graph and is loaded by the frontend even when intraday is
+    # unavailable, so one PSX API failure can never blank the whole stock page.
+    return safe_jsonify(quote)
+
+
+@app.get("/api/market")
+def market():
+    # Market-wide pages must use the same complete PSX quote snapshot as the
+    # All PSX Stocks directory. The legacy ten-symbol development dictionary
+    # is intentionally not used for market breadth or movers.
+    bulk = get_bulk_quotes()
+    stocks = bulk["items"]
+    return safe_jsonify({
+        "kse100": KSE100,
+        "stocks": stocks,
+        "updated_at": bulk["updated_at"],
+        "advancers": sum(1 for stock in stocks if (stock.get("change_pct") or 0) > 0),
+        "decliners": sum(1 for stock in stocks if (stock.get("change_pct") or 0) < 0),
+    })
+
+
+@app.get("/api/extras")
+def extras():
+    return jsonify({
+        "sectors": SECTOR_PERFORMANCE,
+        "macro": MACRO,
+        "macro_signal": compute_macro_signal(MACRO),
+        "announcements": ANNOUNCEMENTS,
+        "breadth": MARKET_BREADTH,
+        "fear_greed": FEAR_GREED,
+        "indices": INDEX_CARDS,
+        "global_sentiment": GLOBAL_SENTIMENT,
+    })
+
+
+@app.get("/api/market-detail/<key>")
+def market_detail(key):
+    item = next((m for m in MULTI_MARKET if m["key"] == key), None)
+    if not item:
+        return jsonify({"error": "Unknown market"}), 404
+    detail = MULTI_MARKET_DETAIL.get(key, {})
+    return jsonify({**item, **detail})
+
+
+@app.get("/api/macro-detail/<key>")
+def macro_detail(key):
+    item = next((m for m in PAKISTAN_PROFILE if m["key"] == key), None)
+    if not item:
+        return jsonify({"error": "Unknown indicator"}), 404
+    return jsonify(item)
+
+
+@app.get("/api/fund-holders/<symbol>")
+def fund_holders(symbol):
+    match = next((r for r in TOP_STOCKS_THREE_WAYS["fund_holdings"] if r["symbol"] == symbol.upper()), None)
+    if not match:
+        return jsonify({
+            "symbol": symbol.upper(),
+            "available": False,
+            "note": "Fund-holder detail is only tracked for the handful of stocks in Top Stocks, Three Ways — a full per-stock fund-holder list needs a licensed holdings feed.",
+        })
+    # Development: which specific funds, since MUFAP's holdings reports
+    # don't expose a public per-stock breakdown — approximate with the
+    # largest funds by AUM from the real MUFAP_FUND_DIRECTORY.
+    top_funds = sorted(
+        [f for f in MUFAP_FUND_DIRECTORY if f.get("aum_mn")],
+        key=lambda f: f["aum_mn"], reverse=True
+    )[:match["funds"]]
+    return jsonify({
+        "symbol": match["symbol"],
+        "company": match["company"],
+        "fund_count": match["funds"],
+        "available": True,
+        "funds": [{"name": f["name"], "amc": f["amc"], "category": f["category"]} for f in top_funds],
+        "note": "Fund list is illustrative (largest real MUFAP funds by AUM) — exact per-stock holdings need a licensed data feed.",
+    })
+
+
+@app.get("/api/market360")
+def market360():
+    """Everything the expanded Markets page needs, beyond what
+    /api/market and /api/extras already cover. See the development-data
+    block near the top of this file for the underlying values."""
+    trending_period = request.args.get("trending_period", "1W")
+    return jsonify({
+        "risk_sentiment": RISK_SENTIMENT,
+        "multi_market": get_multi_market_live(),
+        "cross_asset_signals": CROSS_ASSET_SIGNALS,
+        "cross_asset_highlights": CROSS_ASSET_HIGHLIGHTS,
+        "trending_stocks": get_trending_stocks(trending_period),
+        "trending_periods": list(TRENDING_PERIOD_LABELS.keys()),
+        "week52": WEEK52,
+        "fund_flows": FUND_FLOWS,
+        "insider_activity": INSIDER_ACTIVITY,
+        "sentiment_history": SENTIMENT_HISTORY,
+        "non_equity_sentiment": NON_EQUITY_SENTIMENT,
+        "breadth_pulse": BREADTH_PULSE,
+        "top_stocks_three_ways": TOP_STOCKS_THREE_WAYS,
+        "levels_to_play": LEVELS_TO_PLAY,
+        "seasonality": SEASONALITY,
+        "pakistan_profile": PAKISTAN_PROFILE,
+        "upcoming_payouts": UPCOMING_PAYOUTS,
+        "calendar_events": CALENDAR_EVENTS,
+        "live_data_enabled": bool(MARKET_DATA_API_KEY),
+    })
+
+
+
+# ---------------------------------------------------------
+# PSX market status / last-session helper
+# ---------------------------------------------------------
+PSX_MARKET_TZ = "Asia/Karachi"
+# Official 2026 PSX calendar holidays. Weekends are handled separately.
+# Keeping the list local avoids making the ticker dependent on a second
+# network request just to decide whether today's market is closed.
+PSX_2026_HOLIDAYS = {
+    "2026-02-05", "2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23",
+    "2026-05-01", "2026-05-28", "2026-05-26", "2026-05-27", "2026-05-28",
+    "2026-06-25", "2026-06-26", "2026-08-14", "2026-08-25",
+    "2026-11-09", "2026-12-25",
+}
+
+def _psx_now():
+    if ZoneInfo:
+        return datetime.now(ZoneInfo(PSX_MARKET_TZ))
+    return datetime.now()
+
+def _psx_is_holiday(d):
+    return d.isoformat() in PSX_2026_HOLIDAYS
+
+def _psx_regular_open(now):
+    # Current PSX regular-market schedule: Mon-Thu 09:32-15:30;
+    # Friday has two sessions, 09:17-12:00 and 14:32-16:30.
+    if now.weekday() >= 5 or _psx_is_holiday(now.date()):
+        return False
+    mins = now.hour * 60 + now.minute
+    if now.weekday() < 4:
+        return 9*60+32 <= mins < 15*60+30
+    return (9*60+17 <= mins < 12*60) or (14*60+32 <= mins < 16*60+30)
+
+def _previous_psx_session(d):
+    cur = d - timedelta(days=1)
+    while cur.weekday() >= 5 or _psx_is_holiday(cur):
+        cur -= timedelta(days=1)
+    return cur
+
+def psx_market_status():
+    now = _psx_now()
+    prev = _previous_psx_session(now.date()) if not _psx_is_holiday(now.date()) else _previous_psx_session(now.date())
+    is_open = _psx_regular_open(now)
+    if is_open:
+        label = "Market open"
+    elif now.weekday() >= 5 or _psx_is_holiday(now.date()):
+        label = "Market closed"
+    else:
+        label = "Market closed · outside regular session"
+    return {
+        "is_open": is_open,
+        "label": label,
+        "now": now.isoformat(),
+        "last_session_date": prev.isoformat(),
+        "timezone": PSX_MARKET_TZ,
+        "source": "PSX official trading-hours schedule",
+    }
+
+@app.get("/api/stocks/live")
+def stocks_live():
+    try:
+        status = psx_market_status()
+        bulk = get_bulk_quotes()
+        # A cold Render instance can have an empty in-memory quote cache. Do
+        # one real full-universe fetch so the ticker does not sit on "warming"
+        # indefinitely. Once populated, subsequent calls are cache-backed.
+        if not bulk.get("items"):
+            refresh_bulk_quotes()
+            bulk = get_bulk_quotes()
+        progress = get_recording_progress()
+
+        with _technicals_cache_lock:
+            cache_snapshot = dict(_technicals_cache)
+
+        fund_holders = {
+            row["symbol"]: row["funds"] for row in TOP_STOCKS_THREE_WAYS["fund_holdings"]
+        }
+
+        items = []
+        for q in bulk["items"]:
+            t = cache_snapshot.get(q.get("symbol"))
+            items.append({
+                **q,
+                "rsi14": t.get("rsi14") if t else None,
+                "above_sma50": t.get("above_sma50") if t else None,
+                "above_sma200": t.get("above_sma200") if t else None,
+                "golden_death_cross": t.get("golden_death_cross") if t else None,
+                "data_days": t.get("data_days") if t else 0,
+                "funds_holding": fund_holders.get(q.get("symbol")),
+            })
+
+        return safe_jsonify({
+            "items": items,
+            "updated_at": bulk["updated_at"],
+            "source": (items[0].get("source") if items else "PSX official market feed"),
+            "recording_progress": progress,
+            "market_status": status,
+            "fund_holdings_note": (
+                "Fund-holder counts are only tracked for a handful of top stocks "
+                "(from the Markets page's 'Top Stocks, Three Ways' — see "
+                "TOP_STOCKS_THREE_WAYS in app.py). A full per-stock fund-holder "
+                "list for the whole PSX directory needs a licensed holdings feed."
+            ),
+        })
+    except Exception as exc:
+        return jsonify({"items": [], "updated_at": None, "error": str(exc)}), 200
+
+
+@app.post("/api/stocks/live/refresh")
+def stocks_live_refresh():
+    threading.Thread(target=refresh_bulk_quotes, daemon=True).start()
+    return jsonify({"ok": True, "message": "Refresh started in the background."})
+
+
+@app.get("/api/stock/<symbol>/fundamentals")
+def stock_fundamentals(symbol):
+    return jsonify(get_fundamentals(symbol))
+
+
+def get_recording_progress():
+    """How many distinct trading days of stock_price_history exist so
+    far, since the day this feature was turned on. Used to show real
+    progress toward each technical indicator's activation threshold —
+    never a fabricated 'it's ready' claim."""
+    conn = db()
+    row = conn.execute("SELECT COUNT(DISTINCT day) AS n FROM stock_price_history").fetchone()
+    first = conn.execute("SELECT MIN(day) AS d FROM stock_price_history").fetchone()
+    conn.close()
+    return {"days_recorded": row["n"] if row else 0, "started_on": first["d"] if first else None}
+
+
+def catalog_with_progress():
+    """FILTER_CATALOG, with each history-backed technical item's
+    'reason' replaced by live progress once it's still short of its
+    activation threshold — e.g. '12/50 trading days recorded (24%)'.
+    Items with enough history stay simply marked available."""
+    progress = get_recording_progress()
+    days = progress["days_recorded"]
+
+    sections = []
+    for section in FILTER_CATALOG:
+        items = []
+        for item in section["items"]:
+            item = dict(item)
+            key = item.get("filter_key")
+            if item["available"] and key in TECHNICAL_REQUIREMENTS:
+                item["activating"] = False
+                item["reason"] = "Live: computed from real PSX historical OHLCV on demand."
+            items.append(item)
+        sections.append({**section, "items": items})
+
+    return sections, progress
+
+
+@app.get("/api/screener/catalog")
+def screener_catalog():
+    sections, progress = catalog_with_progress()
+    return jsonify({"sections": sections, "recording_progress": progress})
+
+
+TECHNICAL_CRITERIA_KEYS = {
+    "rsi_min", "rsi_max", "above_sma20", "above_sma50", "above_sma200",
+    "above_ema20", "golden_cross", "death_cross", "macd_bullish", "rsi_oversold", "rsi_overbought",
+}
+
+
+@app.post("/api/screener/run")
+def screener_run():
+    """Fast, cache-first screener.

@@ -1490,6 +1490,14 @@ def init_db():
         nav REAL,
         PRIMARY KEY(day, fund_name)
     );
+
+    CREATE TABLE IF NOT EXISTS screener_results (
+        cache_key TEXT PRIMARY KEY,
+        screener_name TEXT NOT NULL,
+        criteria_json TEXT,
+        result_json TEXT NOT NULL,
+        saved_at TEXT NOT NULL
+    );
     """)
 
     # Upgrade older database: add sort_order to holdings/watchlist if missing.
@@ -1960,7 +1968,7 @@ def get_quote(symbol, force=False):
             if bulk_match is not None:
                 for k in (
                     "price", "change_pct", "volume", "pe_ratio", "dividend_yield",
-                    "volume_30d_avg", "one_year_change", "eps"
+                    "volume_30d_avg", "one_year_change", "eps", "book_value_per_share", "price_to_book"
                 ):
                     if quote.get(k) is None and bulk_match.get(k) is not None:
                         quote[k] = bulk_match.get(k)
@@ -2263,6 +2271,8 @@ def _parse_psx_screener_quotes(html):
     i_y1 = idx("1-year ch")
     i_pe = idx("pe ratio")
     i_eps = idx("eps")
+    i_bvps = idx("book value", "break-up value", "breakup value", "bvps")
+    i_pb = idx("price to book", "p/b", "pb ratio")
     i_div = idx("dividend yield")
     i_float = idx("free float")
     i_vol = idx("30d volume")
@@ -2290,6 +2300,8 @@ def _parse_psx_screener_quotes(html):
             "symbol": symbol, "price": price, "change_pct": pct_at(i_change),
             "one_year_change": pct_at(i_y1), "pe_ratio": num_at(i_pe),
             "eps": num_at(i_eps),
+            "book_value_per_share": num_at(i_bvps),
+            "price_to_book": num_at(i_pb),
             "dividend_yield": pct_at(i_div), "free_float": cells[i_float] if i_float is not None and i_float < len(cells) else None,
             "volume_30d_avg": num_at(i_vol), "source": "PSX official screener (latest/delayed where applicable)",
         })
@@ -3645,6 +3657,46 @@ TECHNICAL_CRITERIA_KEYS = {
 }
 
 
+def _save_screener_result(cache_key, criteria, data):
+    saved_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        conn = db()
+        conn.execute(
+            "INSERT INTO screener_results(cache_key,screener_name,criteria_json,result_json,saved_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json,criteria_json=excluded.criteria_json,saved_at=excluded.saved_at",
+            (cache_key, "PSX Stock Screener", json.dumps(criteria, sort_keys=True, separators=(",", ":")), json.dumps(_clean_for_json(data), separators=(",", ":")), saved_at),
+        )
+        conn.execute(
+            "INSERT INTO screener_results(cache_key,screener_name,criteria_json,result_json,saved_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json,criteria_json=excluded.criteria_json,saved_at=excluded.saved_at",
+            ("psx_screener_latest", "PSX Stock Screener", json.dumps(criteria, sort_keys=True, separators=(",", ":")), json.dumps(_clean_for_json(data), separators=(",", ":")), saved_at),
+        )
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+    data["saved_at"] = saved_at
+    return data
+
+@app.get("/api/screener/last")
+def screener_last():
+    try:
+        conn = db()
+        row = conn.execute("SELECT result_json, criteria_json, saved_at FROM screener_results WHERE cache_key=?", ("psx_screener_latest",)).fetchone()
+        conn.close()
+        if not row:
+            return safe_jsonify({"ok": True, "found": False})
+        return safe_jsonify({"ok": True, "found": True, "result": json.loads(row["result_json"]), "criteria": json.loads(row["criteria_json"] or "{}"), "saved_at": row["saved_at"]})
+    except Exception as exc:
+        return safe_jsonify({"ok": False, "found": False, "error": str(exc)})
+
+@app.post("/api/screener/last/clear")
+def screener_last_clear():
+    try:
+        conn = db(); conn.execute("DELETE FROM screener_results WHERE cache_key=?", ("psx_screener_latest",)); conn.commit(); conn.close()
+    except Exception:
+        pass
+    return safe_jsonify({"ok": True})
+
 @app.post("/api/screener/run")
 def screener_run():
     """Fast, cache-first screener.
@@ -3662,10 +3714,32 @@ def screener_run():
     with _screener_cache_lock:
         hit = _screener_result_cache.get(cache_key)
         if hit and now - hit["time"] < SCREENER_CACHE_SECONDS:
-            return jsonify(hit["data"])
+            return safe_jsonify(hit["data"])
+    # Survive a Gunicorn/Render process restart: restore the exact last run
+    # for this criteria from SQLite instead of forcing another market-wide
+    # calculation.
+    try:
+        conn = db()
+        row = conn.execute("SELECT result_json FROM screener_results WHERE cache_key=?", (cache_key,)).fetchone()
+        conn.close()
+        if row:
+            persisted = json.loads(row["result_json"])
+            with _screener_cache_lock:
+                _screener_result_cache[cache_key] = {"time": now, "data": persisted}
+            return safe_jsonify(persisted)
+    except Exception:
+        pass
 
     bulk = get_bulk_quotes()
+    if not bulk["items"]:
+        try:
+            bulk = get_bulk_quotes(force=True)
+        except Exception:
+            pass
     items = bulk["items"]
+
+    if not items:
+        return safe_jsonify({"count": 0, "scanned": 0, "updated_at": bulk.get("updated_at"), "warming_up": True, "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"), "results": [], "error": "The complete PSX quote universe is still warming up; no partial/development universe was used."})
 
     if TECHNICAL_CRITERIA_KEYS & set(criteria.keys()):
         symbols = [q.get("symbol") for q in items if q.get("symbol")]
@@ -3713,10 +3787,11 @@ def screener_run():
         "results": results[:200],
     }
 
+    data = _save_screener_result(cache_key, criteria, data)
     with _screener_cache_lock:
         _screener_result_cache[cache_key] = {"time": now, "data": data}
 
-    return jsonify(data)
+    return safe_jsonify(data)
 
 
 def _start_mufap_refresh(force=False):
@@ -4880,7 +4955,7 @@ PSX_HISTORY_COLUMN_MAP = {
 def fetch_psx_scraper_history(symbol):
     response = _http_session.get(
         f"{PSX_SCRAPER_API_BASE}/stocks/{symbol.upper()}/history",
-        params={"period": "5y", "interval": "daily"},
+        params={"period": "15y", "interval": "daily"},
         headers={"Accept": "application/json", "User-Agent": HEADERS["User-Agent"]},
         timeout=20,
     )
@@ -4942,47 +5017,77 @@ def _sanitize_ohlcv(df):
 
 
 def fetch_yahoo_psx_intraday(symbol, interval="5m", period="1d"):
-    """Fetch real intraday OHLCV for a PSX .KA symbol when Yahoo exposes it.
-    Yahoo imposes short retention windows on small intervals, so callers pass
-    an interval/period pair that respects those limits.  This is deliberately
-    a separate provider path from daily history: a failure here never causes
-    the reliable daily chart to be replaced by development data."""
+    """Fetch genuine intraday OHLCV for a PSX .KA symbol.
+
+    Direct Yahoo Chart API is tried first. If that endpoint returns an empty
+    result (which happens for some PSX symbols/retention windows), yfinance is
+    used as a second path to the same Yahoo feed. No daily candles are ever
+    substituted for an hourly request.
+    """
     symbol = symbol.upper().strip()
     allowed = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
     if interval not in allowed:
         raise ValueError(f"Unsupported intraday interval: {interval}")
-    if interval == "1h":
-        interval = "60m"
-    response = _http_session.get(
-        YAHOO_CHART_URL.format(symbol=symbol),
-        params={"range": period, "interval": interval, "events": "div,splits", "includeAdjustedClose": "false"},
-        headers={**HEADERS, "Accept": "application/json,text/plain,*/*"}, timeout=12,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    chart = payload.get("chart") or {}
-    if chart.get("error"):
-        raise RuntimeError(str(chart["error"].get("description") or chart["error"]))
-    result = (chart.get("result") or [None])[0]
-    if not result:
-        raise RuntimeError("Yahoo returned no intraday chart result")
-    ts = result.get("timestamp") or []
-    quote = ((result.get("indicators") or {}).get("quote") or [None])[0] or {}
-    if not ts or not quote:
-        raise RuntimeError("Yahoo returned no intraday OHLCV")
-    df = pd.DataFrame({
-        "date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
-        "open": quote.get("open", []), "high": quote.get("high", []),
-        "low": quote.get("low", []), "close": quote.get("close", []),
-        "volume": quote.get("volume", []),
-    })
-    for c in ("open", "high", "low", "close", "volume"):
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
-    df = _sanitize_ohlcv(df)
-    if len(df) < 5:
-        raise RuntimeError("Yahoo returned too few valid intraday candles")
-    return df
+    yahoo_interval = "60m" if interval == "1h" else interval
+    errors = []
+
+    try:
+        response = _http_session.get(
+            YAHOO_CHART_URL.format(symbol=symbol),
+            params={"range": period, "interval": yahoo_interval, "events": "div,splits", "includeAdjustedClose": "false"},
+            headers={**HEADERS, "Accept": "application/json,text/plain,*/*"}, timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        chart = payload.get("chart") or {}
+        if chart.get("error"):
+            raise RuntimeError(str(chart["error"].get("description") or chart["error"]))
+        result = (chart.get("result") or [None])[0]
+        if not result:
+            raise RuntimeError("Yahoo Chart returned no result")
+        ts = result.get("timestamp") or []
+        quote = ((result.get("indicators") or {}).get("quote") or [None])[0] or {}
+        if not ts or not quote:
+            raise RuntimeError("Yahoo Chart returned no intraday OHLCV")
+        df = pd.DataFrame({
+            "date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
+            "open": quote.get("open", []), "high": quote.get("high", []),
+            "low": quote.get("low", []), "close": quote.get("close", []),
+            "volume": quote.get("volume", []),
+        })
+        for c in ("open", "high", "low", "close", "volume"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = _sanitize_ohlcv(df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
+        if len(df) >= 5:
+            return df
+        errors.append(f"Yahoo Chart returned only {len(df)} valid candles")
+    except Exception as exc:
+        errors.append(f"Yahoo Chart: {exc}")
+
+    try:
+        import yfinance as yf
+        df = yf.download(f"{symbol}.KA", interval=yahoo_interval, period=period,
+                         progress=False, auto_adjust=False, threads=False)
+        if df is not None and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+            df = df.reset_index()
+            first = df.columns[0]
+            df = df.rename(columns={first: "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+            for c in ("open", "high", "low", "close", "volume"):
+                if c not in df.columns: df[c] = None
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.tz_convert(None)
+            df = _sanitize_ohlcv(df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
+            if len(df) >= 5:
+                return df
+            errors.append(f"yfinance returned only {len(df)} valid candles")
+        else:
+            errors.append("yfinance returned no data")
+    except Exception as exc:
+        errors.append(f"yfinance: {exc}")
+
+    raise RuntimeError("; ".join(errors[-3:]))
 
 
 def fetch_yahoo_psx_history(symbol, period="max"):
@@ -5315,7 +5420,7 @@ def _normalize_yahoo_batch_frame(frame, ticker):
         return None
 
 
-def _prefetch_psx_histories_batch(symbols, period="5y", batch_size=50, max_workers=3):
+def _prefetch_psx_histories_batch(symbols, period="5y", batch_size=75, max_workers=2):
     """Warm the in-process PSX history cache with batched Yahoo .KA downloads.
 
     A market-wide divergence/technical scan should not issue one HTTP request
@@ -5463,10 +5568,12 @@ def run_psx_divergence_scan(progress_cb=None):
     # performance fix for the 555+ symbol market-wide scan. Progress is
     # reported using the real universe size, so the browser never sits on a
     # misleading 0/0 state during the warm-up phase.
+    scan_started_epoch = time.time()
+    scan_started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     prefetch_started = time.time()
     if progress_cb:
         progress_cb(0, total, f"Preparing batched PSX history for {total} symbols…")
-    prefetched = _prefetch_psx_histories_batch(tickers, period="2y", batch_size=PSX_DIVERGENCE_BATCH_SIZE, max_workers=PSX_DIVERGENCE_BATCH_WORKERS)
+    prefetched = _prefetch_psx_histories_batch(tickers, period="5y", batch_size=PSX_DIVERGENCE_BATCH_SIZE, max_workers=PSX_DIVERGENCE_BATCH_WORKERS)
     prefetch_seconds = round(time.time() - prefetch_started, 2)
     if progress_cb:
         progress_cb(min(prefetched, total), total, f"History cache warmed for {prefetched}/{total} symbols")
@@ -5548,6 +5655,9 @@ def run_psx_divergence_scan(progress_cb=None):
         "history_prefetched": prefetched,
         "history_prefetch_seconds": prefetch_seconds,
         "scan_complete": True,
+        "scan_started_at": scan_started_at,
+        "scan_completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "scan_duration_seconds": round(time.time() - scan_started_epoch, 2),
     }
 
 
@@ -5598,17 +5708,36 @@ def _psx_latest_running_job():
     return None
 
 def _psx_persistent_result():
+    try:
+        conn = db()
+        row = conn.execute("SELECT result_json, saved_at FROM screener_results WHERE cache_key=?", ("psxdivergence_latest",)).fetchone()
+        conn.close()
+        if row:
+            return {"result": json.loads(row["result_json"]), "saved_at": row["saved_at"]}
+    except Exception:
+        pass
     path = PSX_DIVERGENCE_JOB_DIR / "latest_result.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
 def _psx_save_persistent_result(result):
+    saved_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    clean = _clean_for_json(result)
+    try:
+        conn = db()
+        conn.execute(
+            "INSERT INTO screener_results(cache_key,screener_name,criteria_json,result_json,saved_at) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json,saved_at=excluded.saved_at",
+            ("psxdivergence_latest", "PSX Divergence Screener", "{}", json.dumps(clean, separators=(",", ":")), saved_at),
+        )
+        conn.commit(); conn.close()
+    except Exception:
+        pass
     path = PSX_DIVERGENCE_JOB_DIR / "latest_result.json"
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(_clean_for_json(result), separators=(",", ":")), encoding="utf-8")
+    tmp.write_text(json.dumps({"result": clean, "saved_at": saved_at}, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp, path)
 
 def _spawn_psx_divergence_worker(job_id):
@@ -5978,22 +6107,23 @@ def stock_verdict(symbol):
 # toggles) is served from the already-fetched DataFrame.
 
 CHART_TIMEFRAME_CONFIG = {
-    # The button name describes the displayed range, while the candle
-    # interval is explicit and never silently substituted.  1H/5H use real
-    # one-hour candles.  1D/5D use real daily candles.  Longer ranges remain
-    # daily/weekly/monthly historical bars.
-    "1H": {"intraday_interval": "1h", "intraday_period": "5d", "range_hours": 24, "label": "1H · 1h candles", "minimum_bars": 2},
-    "5H": {"intraday_interval": "1h", "intraday_period": "5d", "range_hours": 5, "label": "5H · 1h candles", "minimum_bars": 2},
-    "1D": {"daily_period": "3mo", "range_days": 30, "label": "1D · 1D candles", "minimum_bars": 2},
-    "5D": {"daily_period": "3mo", "range_days": 5, "label": "5D · 1D candles", "minimum_bars": 2},
-    "1M": {"days": 35, "resample": None},
-    "3M": {"days": 95, "resample": None},
-    "6M": {"days": 190, "resample": None},
-    "1Y": {"days": 370, "resample": None},
-    "3Y": {"days": 370 * 3, "resample": "W"},
-    "5Y": {"days": 370 * 5, "resample": "W"},
-    "ALL": {"days": None, "resample": "M"},
+    # Each button is a CANDLE INTERVAL, not merely a display-window label.
+    # The backend retrieves the longest practical source history and then
+    # aggregates it to the requested bar size. This prevents the old bug
+    # where a daily candle was shown for every long timeframe.
+    "1H": {"kind": "intraday", "intraday_interval": "1h", "intraday_period": "730d", "display_days": 60, "label": "1H · 1h candles", "minimum_bars": 5},
+    "5H": {"kind": "intraday", "intraday_interval": "1h", "intraday_period": "730d", "aggregate_hours": 5, "display_days": 365, "label": "5H · 5h candles", "minimum_bars": 5},
+    "1D": {"kind": "daily", "display_days": 365 * 3, "label": "1D · 1d candles", "minimum_bars": 30},
+    "5D": {"kind": "daily", "trading_day_group": 5, "display_days": 365 * 10, "label": "5D · 5d candles", "minimum_bars": 20},
+    "1M": {"kind": "daily", "resample": "MS", "display_days": 365 * 15, "label": "1M · 1mo candles", "minimum_bars": 12},
+    "3M": {"kind": "daily", "resample": "3MS", "display_days": 365 * 15, "label": "3M · 3mo candles", "minimum_bars": 8},
+    "6M": {"kind": "daily", "resample": "6MS", "display_days": 365 * 15, "label": "6M · 6mo candles", "minimum_bars": 5},
+    "1Y": {"kind": "daily", "resample": "YS", "display_days": 365 * 15, "label": "1Y · 1y candles", "minimum_bars": 5},
+    "3Y": {"kind": "daily", "resample": "3YS", "display_days": 365 * 30, "label": "3Y · 3y candles", "minimum_bars": 3},
+    "5Y": {"kind": "daily", "resample": "5YS", "display_days": 365 * 40, "label": "5Y · 5y candles", "minimum_bars": 2},
+    "ALL": {"kind": "daily", "resample": None, "display_days": None, "label": "ALL · 1d candles", "minimum_bars": 30},
 }
+
 CHART_MIN_CANDLES = 5
 
 
@@ -6065,6 +6195,50 @@ def _ohlc_to_candles_and_volume(df, intraday=False):
     return candles, volume
 
 
+def _group_ohlc_by_trading_days(df, days_per_candle=5):
+    """Aggregate daily PSX bars into N-trading-session candles, preserving
+    gaps such as weekends/holidays instead of treating calendar days as bars."""
+    if df is None or df.empty:
+        return df
+    d = df.sort_values("date").reset_index(drop=True).copy()
+    groups = (d.index // int(days_per_candle))
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    if "volume" in d.columns:
+        agg["volume"] = "sum"
+    out = d.groupby(groups, sort=True).agg(agg).reset_index(drop=True)
+    # Use the last trading date in each group as the candle timestamp.
+    out["date"] = d.groupby(groups, sort=True)["date"].last().values
+    return out[["date", "open", "high", "low", "close", "volume"]]
+
+def _group_intraday_hours(df, hours_per_candle=5):
+    """Aggregate 1-hour candles into N-hour candles without combining two
+    separate PSX trading sessions. A normal PSX session therefore produces
+    one 5H candle, while a partial session remains a valid partial candle."""
+    if df is None or df.empty:
+        return df
+    d = df.sort_values("date").reset_index(drop=True).copy()
+    local = pd.to_datetime(d["date"], utc=True).dt.tz_convert("Asia/Karachi")
+    d["_session"] = local.dt.date.astype(str)
+    parts = []
+    for _, part in d.groupby("_session", sort=True):
+        part = part.reset_index(drop=True)
+        for start in range(0, len(part), int(hours_per_candle)):
+            chunk = part.iloc[start:start + int(hours_per_candle)]
+            if chunk.empty:
+                continue
+            row = {
+                "date": chunk["date"].iloc[-1],
+                "open": chunk["open"].iloc[0],
+                "high": chunk["high"].max(),
+                "low": chunk["low"].min(),
+                "close": chunk["close"].iloc[-1],
+                "volume": chunk["volume"].sum() if "volume" in chunk.columns else None,
+            }
+            parts.append(row)
+    return pd.DataFrame(parts, columns=["date", "open", "high", "low", "close", "volume"])
+
+
+
 @app.get("/api/stock/<symbol>/chart")
 def stock_chart(symbol):
     guard = _technicals_guard()
@@ -6075,123 +6249,79 @@ def stock_chart(symbol):
     cfg = dict(CHART_TIMEFRAME_CONFIG.get(timeframe, CHART_TIMEFRAME_CONFIG["1Y"]))
     minimum = int(cfg.get("minimum_bars", CHART_MIN_CANDLES))
 
-    # Intraday: 1H and 5H are genuinely one-hour candles. We request a
-    # multi-day retention window from Yahoo and then slice only the requested
-    # display range. This avoids the old 5-minute candles being mislabeled as
-    # 1H and also gives a useful number of bars when the market is closed.
-    if cfg.get("intraday_interval"):
-        try:
-            chart_df = fetch_yahoo_psx_intraday(symbol, cfg["intraday_interval"], cfg["intraday_period"])
-        except Exception as e:
+    try:
+        if cfg.get("kind") == "intraday":
+            # Yahoo's 60m retention is limited, but it is the correct source
+            # for genuine hourly OHLCV. We request the maximum practical
+            # window and slice locally. No daily fallback is allowed because
+            # that would silently turn an hourly chart into a daily chart.
+            chart_df = fetch_yahoo_psx_intraday(symbol, "1h", cfg.get("intraday_period", "730d"))
+            chart_df = _sanitize_ohlcv(chart_df)
+            if cfg.get("aggregate_hours"):
+                chart_df = _group_intraday_hours(chart_df, cfg["aggregate_hours"])
+            else:
+                cutoff = chart_df["date"].max() - pd.Timedelta(days=int(cfg.get("display_days", 60)))
+                chart_df = chart_df[chart_df["date"] >= cutoff].copy()
+            chart_df = _sanitize_ohlcv(chart_df)
+            if len(chart_df) < minimum:
+                raise RuntimeError(f"Only {len(chart_df)} usable {cfg['label']} were returned by the hourly feed.")
+            candles, volume = _ohlc_to_candles_and_volume(chart_df, intraday=True)
+            indicators = compute_chart_indicator_series(chart_df, intraday=True)
+            basis = chart_df.iloc[-1]
             return safe_jsonify({
-                "available": False, "symbol": symbol.upper(), "timeframe": timeframe,
-                "note": f"1-hour PSX candles are not currently available from the supported live feed: {e}",
+                "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
+                "candle_interval": "5h" if cfg.get("aggregate_hours") else "1h",
+                "data_source": "Yahoo Finance PSX .KA · real hourly OHLCV",
+                "history_span": f"{len(chart_df)} candles",
+                "candles": candles, "volume": volume, "indicators": indicators,
+                "pivot_points": {\
+                    "classic": compute_pivot_points(float(basis["high"]), float(basis["low"]), float(basis["close"])),
+                    "fibonacci": compute_fibonacci_pivot_points(float(basis["high"]), float(basis["low"]), float(basis["close"])),
+                    "basis_date": pd.Timestamp(basis["date"]).date().isoformat(),
+                },
             })
-        if chart_df is None or chart_df.empty:
-            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No one-hour candles were returned by the supported live feed."})
-        latest_ts = chart_df["date"].max()
-        cutoff = latest_ts - pd.Timedelta(hours=float(cfg["range_hours"]))
-        chart_df = chart_df[chart_df["date"] >= cutoff].copy()
-        chart_df = _sanitize_ohlcv(chart_df)
-        if len(chart_df) < minimum:
-            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Not enough {cfg['label']} were returned by the supported live feed."})
-        candles, volume = _ohlc_to_candles_and_volume(chart_df, intraday=True)
-        indicators = compute_chart_indicator_series(chart_df, intraday=True)
-        try:
-            full_df = get_full_history_cached(symbol)
-        except Exception:
-            full_df = None
-        if full_df is None or full_df.empty:
-            full_df = chart_df
-        full_df = full_df.sort_values("date").reset_index(drop=True)
-        completed = full_df[full_df["date"].dt.date < date.today()]
-        pivot_row = completed.iloc[-1] if not completed.empty else full_df.iloc[-1]
-        pivot_high = float(pivot_row["high"]) if pd.notna(pivot_row.get("high")) else float(pivot_row["close"])
-        pivot_low = float(pivot_row["low"]) if pd.notna(pivot_row.get("low")) else float(pivot_row["close"])
-        pivot_close = float(pivot_row["close"])
-        return safe_jsonify({
-            "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
-            "candle_interval": "1h", "data_source": "Yahoo Finance PSX .KA · 1-hour OHLCV",
-            "candles": candles, "volume": volume, "indicators": indicators,
-            "pivot_points": {
-                "classic": compute_pivot_points(pivot_high, pivot_low, pivot_close),
-                "fibonacci": compute_fibonacci_pivot_points(pivot_high, pivot_low, pivot_close),
-                "basis_date": pivot_row["date"].date().isoformat() if pd.notna(pivot_row["date"]) else None,
-            },
-        })
 
-    # 1D/5D are deliberately daily candles, not 15m/30m intraday bars.
-    if cfg.get("daily_period"):
-        try:
-            chart_df = get_full_history_cached(symbol)
-        except Exception as e:
-            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Daily PSX history is not currently available: {e}"})
-        if chart_df is None or chart_df.empty:
-            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No daily PSX history is available for this symbol."})
-        chart_df = chart_df.sort_values("date").reset_index(drop=True)
-        if cfg.get("range_days") is not None:
-            chart_df = chart_df.tail(max(int(cfg["range_days"]), minimum)).copy()
+        full_df = get_full_history_cached(symbol)
+        if full_df is None or full_df.empty:
+            raise RuntimeError("No daily PSX history is available for this symbol.")
+        full_df = _sanitize_ohlcv(full_df.sort_values("date").reset_index(drop=True))
+        if cfg.get("display_days") is not None:
+            cutoff = full_df["date"].max() - pd.Timedelta(days=int(cfg["display_days"]))
+            windowed = full_df[full_df["date"] >= cutoff].copy()
+        else:
+            windowed = full_df.copy()
+
+        if timeframe == "5D":
+            chart_df = _group_ohlc_by_trading_days(windowed, 5)
+        elif cfg.get("resample"):
+            chart_df = resample_ohlc(windowed, cfg["resample"])
+        else:
+            chart_df = windowed
         chart_df = _sanitize_ohlcv(chart_df)
         if len(chart_df) < minimum:
-            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Not enough daily candles for {cfg['label']}."})
+            raise RuntimeError(f"Only {len(chart_df)} usable {cfg['label']} were returned by the available PSX history.")
+
         candles, volume = _ohlc_to_candles_and_volume(chart_df, intraday=False)
         indicators = compute_chart_indicator_series(chart_df, intraday=False)
         completed = chart_df[chart_df["date"].dt.date < date.today()]
-        pivot_row = completed.iloc[-1] if not completed.empty else chart_df.iloc[-1]
-        pivot_high = float(pivot_row["high"]) if pd.notna(pivot_row["high"]) else float(pivot_row["close"])
-        pivot_low = float(pivot_row["low"]) if pd.notna(pivot_row["low"]) else float(pivot_row["close"])
-        pivot_close = float(pivot_row["close"])
+        basis = completed.iloc[-1] if not completed.empty else chart_df.iloc[-1]
         return safe_jsonify({
             "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
-            "candle_interval": "1d", "data_source": "PSX-compatible daily OHLCV history · 1-day candles",
+            "candle_interval": cfg["label"].split("·", 1)[-1].strip().replace(" candles", ""),
+            "data_source": "PSX-compatible historical OHLCV provider chain",
+            "history_span": f"{len(chart_df)} candles",
             "candles": candles, "volume": volume, "indicators": indicators,
             "pivot_points": {
-                "classic": compute_pivot_points(pivot_high, pivot_low, pivot_close),
-                "fibonacci": compute_fibonacci_pivot_points(pivot_high, pivot_low, pivot_close),
-                "basis_date": pivot_row["date"].date().isoformat() if pd.notna(pivot_row["date"]) else None,
+                "classic": compute_pivot_points(float(basis["high"]), float(basis["low"]), float(basis["close"])),
+                "fibonacci": compute_fibonacci_pivot_points(float(basis["high"]), float(basis["low"]), float(basis["close"])),
+                "basis_date": pd.Timestamp(basis["date"]).date().isoformat(),
             },
         })
-
-    try:
-        full_df = get_full_history_cached(symbol)
     except Exception as e:
-        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Could not load chart data: {e}"})
-    if full_df is None or full_df.empty:
-        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No price history is available for this symbol from PSX."})
-    full_df = full_df.sort_values("date").reset_index(drop=True)
-    completed = full_df[full_df["date"].dt.date < date.today()]
-    pivot_row = completed.iloc[-1] if not completed.empty else full_df.iloc[-1]
-    pivot_high = float(pivot_row["high"]) if pd.notna(pivot_row["high"]) else float(pivot_row["close"])
-    pivot_low = float(pivot_row["low"]) if pd.notna(pivot_row["low"]) else float(pivot_row["close"])
-    pivot_close = float(pivot_row["close"])
-
-    if cfg["days"] is not None:
-        cutoff = full_df["date"].iloc[-1] - pd.Timedelta(days=cfg["days"])
-        windowed = full_df[full_df["date"] >= cutoff].reset_index(drop=True)
-    else:
-        windowed = full_df
-    chart_df = resample_ohlc(windowed, cfg["resample"]) if cfg["resample"] else windowed
-    if chart_df is None or chart_df.empty or len(chart_df) < CHART_MIN_CANDLES:
-        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "Not enough price history for this timeframe yet."})
-    chart_df = _sanitize_ohlcv(chart_df)
-    candles, volume = _ohlc_to_candles_and_volume(chart_df, intraday=False)
-    indicators = compute_chart_indicator_series(chart_df, intraday=False)
-    return safe_jsonify({
-        "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
-        "candle_interval": "1d" if not cfg.get("resample") else cfg["resample"].lower(),
-        "data_source": "PSX-compatible historical OHLCV provider chain (real market data)",
-        "candles": candles, "volume": volume, "indicators": indicators,
-        "pivot_points": {
-            "classic": compute_pivot_points(pivot_high, pivot_low, pivot_close),
-            "fibonacci": compute_fibonacci_pivot_points(pivot_high, pivot_low, pivot_close),
-            "basis_date": pivot_row["date"].date().isoformat() if pd.notna(pivot_row["date"]) else None,
-        },
-    })
-
-
-# =====================================================================
-# PORTFOLIO CSV IMPORT / EXPORT (merged in from the PSX Toolkit)
-# =====================================================================
+        return safe_jsonify({
+            "available": False, "symbol": symbol.upper(), "timeframe": timeframe,
+            "note": f"Could not load genuine {cfg.get('label', timeframe)}: {e}",
+        })
 
 @app.get("/api/portfolio/export")
 def portfolio_export_csv():

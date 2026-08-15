@@ -1054,6 +1054,8 @@ function renderSymbolPage() {
     const changePct = live?.change_pct;
     const pe = live?.pe_ratio;
     const eps = live?.eps;
+    const bookValue = live?.book_value_per_share;
+    const priceToBook = live?.price_to_book;
     const dividendYield = live?.dividend_yield;
     const avgVolume = live?.volume_30d_avg;
     const rsi = live?.rsi14;
@@ -1076,6 +1078,8 @@ function renderSymbolPage() {
         <td>${avgVolume == null ? "—" : Number(avgVolume).toLocaleString()}</td>
         <td>${pe == null ? "—" : Number(pe).toFixed(2)}</td>
         <td>${eps == null ? "—" : Number(eps).toFixed(2)}</td>
+        <td>${bookValue == null ? "—" : Number(bookValue).toFixed(2)}</td>
+        <td>${priceToBook == null ? "—" : Number(priceToBook).toFixed(2)}</td>
         <td>${dividendYield == null ? "—" : `${Number(dividendYield).toFixed(2)}%`}</td>
         <td>
           ${rsi == null
@@ -1291,8 +1295,8 @@ async function openStock(symbol) {
   loadFundamentals(symbol);
   loadStockFinancials(symbol);
   loadTechnicalVerdict(symbol);
-  document.querySelectorAll(".chart-tf-btn").forEach(b => b.classList.toggle("active", b.dataset.tf === "1Y"));
-  loadStockChart(symbol, "1Y");
+  document.querySelectorAll(".chart-tf-btn").forEach(b => b.classList.toggle("active", b.dataset.tf === "1D"));
+  loadStockChart(symbol, "1D");
 }
 
 async function loadStockFinancials(symbol) {
@@ -3518,6 +3522,21 @@ async function loadScreener() {
   }
   populateScreenerSectors();
   renderScreenerPresets();
+  await loadLastSavedScreener();
+}
+
+async function loadLastSavedScreener() {
+  try {
+    const d = await getJSON("/api/screener/last");
+    if (!d.ok || !d.found || !d.result) return;
+    const r = d.result;
+    renderActiveFilterChips(d.criteria || {});
+    $("screenerResultCount").textContent = `${r.count} match${r.count === 1 ? "" : "es"} of ${r.scanned} scanned · Last scan ${new Date(d.saved_at || r.saved_at).toLocaleString()}`;
+    $("screenerResults").innerHTML = r.results && r.results.length
+      ? `<div class="muted-note">Restored saved screener results after server restart.</div>` + `<table><thead><tr><th>Symbol</th><th>Company</th><th>Sector</th><th>Price</th><th>Change %</th><th>P/E</th><th>Volume</th></tr></thead><tbody>${r.results.map(x => `<tr class="clickable-row" data-symbol-open="${esc(x.symbol)}"><td class="symbol">${esc(x.symbol)}</td><td>${esc(x.company || "—")}</td><td>${esc(x.sector || "—")}</td><td>${x.price == null ? "—" : Number(x.price).toFixed(2)}</td><td>${x.change_pct == null ? "—" : `${Number(x.change_pct).toFixed(2)}%`}</td><td>${x.pe_ratio == null ? "—" : Number(x.pe_ratio).toFixed(2)}</td><td>${x.volume == null ? "—" : Number(x.volume).toLocaleString()}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="empty-chart">No stocks matched the saved filters.</div>`;
+    document.querySelectorAll("[data-symbol-open]").forEach(el => el.addEventListener("click", () => openStock(el.dataset.symbolOpen)));
+  } catch (_) {}
 }
 
 function populateScreenerSectors() {
@@ -3660,7 +3679,7 @@ async function runScreener(presetCriteria = null) {
     if (!response.ok) throw new Error(`Request failed: ${response.status}`);
     const d = await response.json();
 
-    $("screenerResultCount").textContent = `${d.count} match${d.count === 1 ? "" : "es"} of ${d.scanned} scanned`;
+    $("screenerResultCount").textContent = `${d.count} match${d.count === 1 ? "" : "es"} of ${d.scanned} scanned${d.saved_at ? ` · Last scan ${new Date(d.saved_at).toLocaleString()}` : ""}`;
 
     $("screenerResults").innerHTML = d.results.length
       ? `
@@ -3942,7 +3961,8 @@ function renderPsxDivTable(rows, cols) {
 }
 
 function renderPsxDivergenceResult(result, resultsEl) {
-  const scanSummary = `<div class="tech-scan-block"><h3>Scan Summary</h3><p class="muted-note">Universe: <strong>${Number(result.universe_count || result.symbols_scanned || 0).toLocaleString()}</strong> symbols · Usable data: <strong>${Number(result.symbols_with_data || 0).toLocaleString()}</strong> · Insufficient history: <strong>${Number(result.symbols_skipped_insufficient_history || 0).toLocaleString()}</strong> · Failed: <strong>${Number(result.symbols_failed || 0).toLocaleString()}</strong> · Bullish divergence hits: <strong>${Number((result.bullish_divergence_all || []).length).toLocaleString()}</strong> · Bearish divergence hits: <strong>${Number((result.bearish_divergence_all || []).length).toLocaleString()}</strong></p></div>`;
+  const scanTime = result.scan_completed_at || result.scan_started_at || result.saved_at || null;
+  const scanSummary = `<div class="tech-scan-block"><h3>Scan Summary</h3><p class="muted-note">Last completed scan: <strong>${scanTime ? esc(new Date(scanTime).toLocaleString()) : "—"}</strong>${result.scan_duration_seconds != null ? ` · Duration: <strong>${Number(result.scan_duration_seconds).toFixed(1)}s</strong>` : ""}<br>Universe: <strong>${Number(result.universe_count || result.symbols_scanned || 0).toLocaleString()}</strong> symbols · Usable data: <strong>${Number(result.symbols_with_data || 0).toLocaleString()}</strong> · Insufficient history: <strong>${Number(result.symbols_skipped_insufficient_history || 0).toLocaleString()}</strong> · Failed: <strong>${Number(result.symbols_failed || 0).toLocaleString()}</strong> · Bullish divergence hits: <strong>${Number((result.bullish_divergence_all || []).length).toLocaleString()}</strong> · Bearish divergence hits: <strong>${Number((result.bearish_divergence_all || []).length).toLocaleString()}</strong></p></div>`;
   const sections = [
     ["personalized_matches", "Personalized PSX Setup — Confirmed Matches", "A bullish reversal requires all of: within 3% of the 52-week low, bullish RSI divergence on at least one of 1D/1W/1M, pivot RSI ≤50 (strong ≤30), downtrend structure (LH+LL), and a green Heikin-Ashi confirmation. A bearish reversal requires bearish divergence on at least one timeframe, pivot RSI ≥70 (strong ≥90), uptrend structure (HH+HL), and a red Heikin-Ashi confirmation."],
     ["near_low_bullish_divergence", "52-Week Low + Bullish RSI Divergence", "Price is within the configured 3% of its 52-week low AND has a mathematically confirmed bullish RSI divergence."],
@@ -4068,7 +4088,7 @@ let candleSeries = null, volumeSeries = null, rsiSeries = null, macdLineSeries =
 let overlaySeriesMap = {};
 let srPriceLines = [];
 let currentChartSymbol = null;
-let currentChartTimeframe = "1Y";
+let currentChartTimeframe = "1D";
 let lastChartData = null;
 
 const CHART_COLORS = {
@@ -4116,7 +4136,7 @@ async function loadStockChart(symbol, timeframe) {
       return;
     }
     statusEl.textContent = d.data_source
-      ? `${d.data_source} · ${d.timeframe || currentChartTimeframe}${d.candle_interval ? ` · ${d.candle_interval} candles` : ""}`
+      ? `${d.data_source} · ${d.timeframe || currentChartTimeframe}${d.candle_interval ? ` · ${d.candle_interval} candles` : ""}${d.history_span ? ` · ${d.history_span}` : ""}`
       : "";
     lastChartData = d;
     // Render on the next paint so the stock-detail page has a real width

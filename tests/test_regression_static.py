@@ -26,7 +26,7 @@ def test_real_history_fallbacks_exist():
 
 
 def test_chart_monthly_resample_is_pandas_compatible():
-    assert '"ALL": {"days": None, "resample": "M"}' in APP
+    assert '"ALL": {"kind": "daily", "resample": None' in APP
     assert '"div_1m", full_df, "M"' in APP
 
 
@@ -38,4 +38,4 @@ def test_indicator_values_and_pivots_are_rendered():
 
 
 def test_service_worker_cache_is_bumped():
-    assert 'psx-360-shell-v11' in SW
+    assert 'psx-360-shell-v12' in SW
