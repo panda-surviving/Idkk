@@ -52,7 +52,7 @@ def test_announcement_feed_has_multiple_official_streams():
     assert 'CDC Notices' in APP
     assert 'NCCPL Notices' in APP
     assert 'Payouts' in APP
-    assert 'psx-360-shell-v12' in SW
+    assert 'psx-360-shell-v13' in SW
 
 
 def test_divergence_scans_multiple_recent_pivot_pairs():

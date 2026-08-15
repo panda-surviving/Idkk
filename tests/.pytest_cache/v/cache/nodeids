@@ -1,0 +1,20 @@
+[
+  "test_regression_static.py::test_chart_monthly_resample_is_pandas_compatible",
+  "test_regression_static.py::test_full_scan_never_uses_ten_symbol_fallback",
+  "test_regression_static.py::test_indicator_values_and_pivots_are_rendered",
+  "test_regression_static.py::test_psx_historical_request_has_required_parameters",
+  "test_regression_static.py::test_real_history_fallbacks_exist",
+  "test_regression_static.py::test_service_worker_cache_is_bumped",
+  "test_v13_static.py::test_insider_licensed_path_and_fundamental_enrichment",
+  "test_v13_static.py::test_manual_stock_screener_audit",
+  "test_v13_static.py::test_no_daily_fallback_for_intraday",
+  "test_v13_static.py::test_true_chart_timeframes_and_1y_button",
+  "test_v7_static.py::test_announcement_feed_has_multiple_official_streams",
+  "test_v7_static.py::test_chart_timeframes_use_explicit_candle_intervals",
+  "test_v7_static.py::test_divergence_progress_has_real_universe_before_callback",
+  "test_v7_static.py::test_divergence_scans_multiple_recent_pivot_pairs",
+  "test_v7_static.py::test_market_wide_quote_path_is_official_screener_not_dev_subset",
+  "test_v7_static.py::test_multi_timeframe_setup_uses_matching_timeframe",
+  "test_v7_static.py::test_personalized_setup_is_a_real_conjunction",
+  "test_v7_static.py::test_quote_path_never_returns_legacy_development_prices"
+]

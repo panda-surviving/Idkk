@@ -3660,6 +3660,45 @@ function renderActiveFilterChips(criteria) {
     : `<span class="muted-note">No filters yet — add some above, then press Run Screener.</span>`;
 }
 
+function renderManualScreenerVerdict(d) {
+  const el=$("manualScreenerResults");
+  if (!el) return;
+  if (!d.ok) { el.innerHTML=`<div class="error-panel">${esc(d.error || "Could not evaluate stock")}</div>`; return; }
+  const c=d.conditions||[];
+  const rows=c.map(x=>{
+    const state=x.passed===true ? "PASS" : x.passed===false ? "FAIL" : "UNAVAILABLE";
+    const cls=x.passed===true ? "positive" : x.passed===false ? "negative" : "muted-note";
+    let value=x.value;
+    if (typeof value === "number") value=Math.abs(value)>=1000 ? Number(value).toLocaleString(undefined,{maximumFractionDigits:2}) : Number(value).toFixed(2);
+    return `<tr><td><strong>${esc(x.label)}</strong><small>${esc(x.rule||"")}</small></td><td>${value==null?"—":esc(String(value))}</td><td class="${cls}"><strong>${state}</strong></td></tr>`;
+  }).join("");
+  const p=d.personalized_setup;
+  const ps=p && p.available!==false ? `<div class="tech-scan-block"><h4>Personalized RSI-Divergence Setup</h4><div class="manual-setup-grid">
+    <span>52W low ≤3%: <b>${p.near_52w_low?"PASS":"FAIL"}</b></span>
+    <span>1D bull div: <b>${p.bullish_divergence_1d?"YES":"NO"}</b></span><span>1W bull div: <b>${p.bullish_divergence_1w?"YES":"NO"}</b></span><span>1M bull div: <b>${p.bullish_divergence_1m?"YES":"NO"}</b></span>
+    <span>1D bear div: <b>${p.bearish_divergence_1d?"YES":"NO"}</b></span><span>1W bear div: <b>${p.bearish_divergence_1w?"YES":"NO"}</b></span><span>1M bear div: <b>${p.bearish_divergence_1m?"YES":"NO"}</b></span>
+    <span>Bull RSI ≤50: <b>${p.bullish_rsi_50?"PASS":"FAIL"}</b></span><span>Strong bull ≤30: <b>${p.bullish_rsi_30?"PASS":"FAIL"}</b></span>
+    <span>Bear RSI ≥70: <b>${p.bearish_rsi_70?"PASS":"FAIL"}</b></span><span>Strong bear ≥90: <b>${p.bearish_rsi_90?"PASS":"FAIL"}</b></span>
+    <span>Heikin-Ashi: <b>${esc(p.heikin_ashi||"—")}</b></span><span>Structure: <b>${esc(p.structure||"—")}</b></span>
+    <span>Final personalized match: <b>${p.personalized_match?"YES":"NO"}</b>${p.setup?` · ${esc(p.setup)}`:""}</span>
+  </div></div>` : `<div class="muted-note">Personalized divergence setup could not be evaluated: ${esc(p?.error || "insufficient real history")}</div>`;
+  el.innerHTML=`<div class="tech-scan-block"><h3>${esc(d.symbol)}${d.company?` — ${esc(d.company)}`:""}</h3><p class="muted-note">Price: <b>${d.price==null?"—":Number(d.price).toFixed(2)}</b> · Real history: <b>${Number(d.data_days||0).toLocaleString()} trading days</b> · <b>${d.summary.passed}</b> pass · <b>${d.summary.failed}</b> fail · <b>${d.summary.unavailable}</b> unavailable</p><div class="tech-scan-table-wrap"><table><thead><tr><th>My Screener Point</th><th>Measured Value</th><th>Verdict</th></tr></thead><tbody>${rows}</tbody></table></div></div>${ps}`;
+}
+
+async function checkManualScreenerStock() {
+  const input=$("manualScreenerSymbol"); const btn=$("manualScreenerCheckBtn"); const el=$("manualScreenerResults");
+  const symbol=(input?.value||"").trim().toUpperCase();
+  if (!symbol) { if(el) el.innerHTML=`<div class="error-panel">Enter a PSX symbol first.</div>`; return; }
+  if(btn) { btn.disabled=true; btn.textContent="Checking…"; }
+  if(el) el.innerHTML=`<div class="loading-panel">Checking ${esc(symbol)} against the real PSX technical history…</div>`;
+  try { const d=await getJSON(`/api/screener/stock-verdict/${encodeURIComponent(symbol)}`); renderManualScreenerVerdict(d); }
+  catch(e) { if(el) el.innerHTML=`<div class="error-panel">${esc(e.message)}</div>`; }
+  finally { if(btn) { btn.disabled=false; btn.textContent="Check Stock"; } }
+}
+
+$("manualScreenerCheckBtn")?.addEventListener("click", checkManualScreenerStock);
+$("manualScreenerSymbol")?.addEventListener("keydown", e=>{ if(e.key==="Enter") checkManualScreenerStock(); });
+
 async function runScreener(presetCriteria = null) {
   const criteria = presetCriteria || collectScreenerCriteria();
   renderActiveFilterChips(criteria);

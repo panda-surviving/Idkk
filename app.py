@@ -101,6 +101,16 @@ PSX_ALT_COMPANY_URL = f"{PSX_ALT_BASE}/company/{{symbol}}"
 PSX_ALT_INTRADAY_URL = f"{PSX_ALT_BASE}/timeseries/int/{{symbol}}"
 PSX_ALT_ELIGIBLE_URL = f"{PSX_ALT_BASE}/eligible-scrips"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.KA"
+
+# Optional licensed PSX intraday/fundamentals provider. Capital Stake is an
+# authorized PSX data vendor and exposes genuine 1m/5m/15m OHLCV, insider
+# transactions and audited fundamentals. The app only uses it when a token is
+# configured; it never fabricates hourly candles when no genuine feed exists.
+CAPITAL_STAKE_API_TOKEN = os.environ.get("CAPITAL_STAKE_API_TOKEN", "").strip()
+CAPITAL_STAKE_API_BASE = os.environ.get("CAPITAL_STAKE_API_BASE", "https://csapis.com/3.0").rstrip("/")
+CAPITAL_STAKE_CHART_ENDPOINT = os.environ.get("CAPITAL_STAKE_CHART_ENDPOINT", "/market/chart")
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
+
 PSX_SCRAPER_API_BASE = os.environ.get("PSX_SCRAPER_API_BASE", "https://nifraa-psx-stock-intel.hf.space/api").rstrip("/")
 PSX_SCREENER_URL = "https://dps.psx.com.pk/screener/"
 PSX_ALT_SCREENER_URL = f"{PSX_ALT_BASE}/screener/"
@@ -2469,6 +2479,44 @@ def _stock_volume_periods(symbol):
         "avg_volume_1m": int(last21.mean()),
     }
 
+def _capital_stake_get_json(path, params):
+    if not CAPITAL_STAKE_API_TOKEN:
+        raise RuntimeError("CAPITAL_STAKE_API_TOKEN is not configured")
+    r=_http_session.get(CAPITAL_STAKE_API_BASE+path, params=params, headers={"Authorization":f"Bearer {CAPITAL_STAKE_API_TOKEN}","Accept":"application/json"}, timeout=20)
+    r.raise_for_status()
+    body=r.json()
+    if isinstance(body,dict) and str(body.get("status","ok")).lower()=="error":
+        raise RuntimeError(str(body.get("message") or body.get("error") or "Capital Stake error"))
+    return body
+
+
+def fetch_capital_stake_key_metrics(symbol):
+    """Return latest genuine Capital Stake fundamental metrics when licensed."""
+    body=_capital_stake_get_json("/company/fundamentals/key-metrics/annual", {"symbol":symbol.upper()})
+    data=body.get("data",body) if isinstance(body,dict) else {}
+    periods=data.get("periods") or []
+    rows=data.get("fundementals") or data.get("fundamentals") or []
+    out={"source":"Capital Stake / PSX licensed data","period":periods[0] if periods else None}
+    aliases={
+        "Book Value per Share (Rs.)":"book_value_per_share", "Price/Book Ratio":"price_to_book",
+        "Dividend Yield (%)":"dividend_yield_pct", "Dividend per Share (Rs.)":"dividend_per_share",
+        "Earnings per Share":"eps_ttm", "Price Earnings Ratio":"pe_ratio_ttm",
+        "Current Ratio (Times)":"current_ratio", "Long term Debt to Equity":"debt_to_equity",
+        "Return on Equity":"return_on_equity_pct", "Return on Assets":"return_on_assets_pct",
+        "Payout Ratio":"dividend_payout_pct", "Number of Shares":"shares_outstanding",
+    }
+    for row in rows:
+        name=str(row.get("name") or row.get("label") or "").strip()
+        vals=row.get("values") or []
+        key=aliases.get(name)
+        if key and vals:
+            try:
+                val=vals[0]
+                if val is not None: out[key]=float(val)
+            except Exception: pass
+    return out
+
+
 def get_fundamentals(symbol):
     """Return source-backed PSX fundamentals and calculated TTM values.
 
@@ -2496,13 +2544,19 @@ def get_fundamentals(symbol):
             eps_ttm = None
 
     volume_periods = _stock_volume_periods(symbol)
+    licensed = {}
+    if CAPITAL_STAKE_API_TOKEN:
+        try:
+            licensed = fetch_capital_stake_key_metrics(symbol)
+        except Exception:
+            licensed = {}
 
     return {
         "symbol": symbol.upper(),
         "company": quote.get("company"),
         "sector": quote.get("sector"),
         "price": quote.get("price"),
-        "pe_ratio_ttm": quote.get("pe_ratio"),
+        "pe_ratio_ttm": licensed.get("pe_ratio_ttm", quote.get("pe_ratio")),
         "one_year_change_pct": quote.get("one_year_change"),
         "ytd_change_pct": quote.get("ytd_change"),
         "ldcp": quote.get("ldcp"),
@@ -2511,23 +2565,23 @@ def get_fundamentals(symbol):
         "volume": quote.get("volume"),
         "volume_30d_avg": quote.get("volume_30d_avg"),
         **volume_periods,
-        "eps_ttm": eps_ttm,
+        "eps_ttm": licensed.get("eps_ttm", eps_ttm),
         "eps_latest_annual": annual_eps,
         "eps_quarterly": q_eps,
-        "book_value_per_share": quote.get("book_value_per_share"),
-        "price_to_book": quote.get("price_to_book"),
-        "dividend_yield_pct": quote.get("dividend_yield_pct") if quote.get("dividend_yield_pct") is not None else quote.get("dividend_yield"),
+        "book_value_per_share": licensed.get("book_value_per_share", quote.get("book_value_per_share")),
+        "price_to_book": licensed.get("price_to_book", quote.get("price_to_book")),
+        "dividend_yield_pct": licensed.get("dividend_yield_pct", quote.get("dividend_yield_pct") if quote.get("dividend_yield_pct") is not None else quote.get("dividend_yield")),
         "market_cap": quote.get("market_cap"),
         "shares_outstanding": quote.get("shares_outstanding"),
         "free_float_shares": quote.get("free_float_shares"),
         "free_float_pct": quote.get("free_float_pct"),
         "face_value": quote.get("face_value"),
-        "dividend_per_share": quote.get("dividend_per_share"),
-        "dividend_payout_pct": quote.get("dividend_payout_pct"),
-        "debt_to_equity": quote.get("debt_to_equity"),
-        "current_ratio": quote.get("current_ratio"),
-        "return_on_equity_pct": quote.get("return_on_equity_pct"),
-        "return_on_assets_pct": quote.get("return_on_assets_pct"),
+        "dividend_per_share": licensed.get("dividend_per_share", quote.get("dividend_per_share")),
+        "dividend_payout_pct": licensed.get("dividend_payout_pct", quote.get("dividend_payout_pct")),
+        "debt_to_equity": licensed.get("debt_to_equity", quote.get("debt_to_equity")),
+        "current_ratio": licensed.get("current_ratio", quote.get("current_ratio")),
+        "return_on_equity_pct": licensed.get("return_on_equity_pct", quote.get("return_on_equity_pct")),
+        "return_on_assets_pct": licensed.get("return_on_assets_pct", quote.get("return_on_assets_pct")),
         "dividend_history": [],
         "source": quote.get("source"),
         "note": (
@@ -3677,6 +3731,69 @@ def _save_screener_result(cache_key, criteria, data):
     data["saved_at"] = saved_at
     return data
 
+@app.get("/api/screener/stock-verdict/<symbol>")
+def screener_stock_verdict(symbol):
+    """Explain every live technical-screener point for one PSX stock.
+
+    This is an audit-style verdict, not a generic score: each criterion has
+    the actual measured value, pass/fail/unavailable state and a short reason.
+    The personalized divergence setup is included separately when enough
+    genuine daily history exists.
+    """
+    sym=symbol.upper().strip()
+    try:
+        tech=compute_technicals(sym)
+        quote=get_quote(sym)
+        conditions=[]
+        def add(key,label,passed,value,rule):
+            conditions.append({"key":key,"label":label,"passed":passed if passed is not None else None,"value":value,"rule":rule})
+        price=tech.get("price")
+        add("ema20","Price above EMA20", tech.get("above_ema20"), tech.get("ema20"), "Close > EMA20")
+        add("sma50","Price above SMA50", tech.get("above_sma50"), tech.get("sma50"), "Close > SMA50")
+        add("sma100","Price above SMA100", (price is not None and tech.get("sma100") is not None and price>tech["sma100"]) if tech.get("sma100") is not None else None, tech.get("sma100"), "Close > SMA100")
+        add("sma200","Price above SMA200", tech.get("above_sma200"), tech.get("sma200"), "Close > SMA200")
+        add("golden_cross","Golden Cross", tech.get("golden_death_cross")=="golden_cross" if tech.get("golden_death_cross") is not None else None, tech.get("golden_death_cross"), "SMA50 crosses above SMA200")
+        add("death_cross","Death Cross", tech.get("golden_death_cross")=="death_cross" if tech.get("golden_death_cross") is not None else None, tech.get("golden_death_cross"), "SMA50 crosses below SMA200")
+        add("rsi_oversold","RSI oversold", tech.get("rsi_oversold"), tech.get("rsi14"), "RSI(14) ≤ 30")
+        add("rsi_overbought","RSI overbought", tech.get("rsi_overbought"), tech.get("rsi14"), "RSI(14) ≥ 70")
+        add("macd_bullish","MACD bullish", tech.get("macd_bullish"), tech.get("macd_histogram"), "MACD histogram > 0")
+        add("obv","OBV available", tech.get("obv") is not None, tech.get("obv"), "Real OHLCV volume is available for OBV")
+        vol=quote.get("volume")
+        add("high_volume","High volume", (vol is not None and vol>=5_000_000) if vol is not None else None, vol, "Latest volume ≥ 5,000,000")
+        low52,high52=quote.get("low52"),quote.get("high52")
+        pos=((price-low52)/(high52-low52)*100) if price is not None and low52 is not None and high52 is not None and high52>low52 else None
+        add("near_52w_low","Near 52-week low", pos is not None and pos<=10 if pos is not None else None, pos, "Price is in the bottom 10% of its 52-week range")
+        add("near_52w_high","Near 52-week high", pos is not None and pos>=90 if pos is not None else None, pos, "Price is in the top 10% of its 52-week range")
+        personalized=None
+        try:
+            full=get_divergence_history_cached(sym)
+            if full is not None and len(full)>=PSX_DIVERGENCE_MIN_TRADING_DAYS:
+                start=full["date"].min().date().isoformat()
+                analysis=_analyze_one_psx_divergence_symbol(sym,start)
+                b=analysis.get("base_info") or {}
+                personalized={
+                    "near_52w_low": bool(analysis.get("is_near_low")),
+                    "bullish_divergence_1d": b.get("div_1d")=="Bullish",
+                    "bullish_divergence_1w": b.get("div_1w")=="Bullish",
+                    "bullish_divergence_1m": b.get("div_1m")=="Bullish",
+                    "bearish_divergence_1d": b.get("div_1d")=="Bearish",
+                    "bearish_divergence_1w": b.get("div_1w")=="Bearish",
+                    "bearish_divergence_1m": b.get("div_1m")=="Bearish",
+                    "bullish_rsi_50": b.get("bullish_rsi_50"), "bullish_rsi_30": b.get("bullish_rsi_30"),
+                    "bearish_rsi_70": b.get("bearish_rsi_70"), "bearish_rsi_90": b.get("bearish_rsi_90"),
+                    "heikin_ashi": b.get("ha_color"), "structure": b.get("structure"),
+                    "personalized_match": b.get("personalized_match"), "setup": b.get("personalized_setup"),
+                }
+        except Exception as exc:
+            personalized={"available":False,"error":str(exc)}
+        passed=sum(1 for c in conditions if c["passed"] is True)
+        failed=sum(1 for c in conditions if c["passed"] is False)
+        unavailable=sum(1 for c in conditions if c["passed"] is None)
+        return safe_jsonify({"ok":True,"symbol":sym,"company":quote.get("company"),"price":price,"conditions":conditions,"summary":{"passed":passed,"failed":failed,"unavailable":unavailable,"total":len(conditions)},"personalized_setup":personalized,"data_days":tech.get("data_days"),"source":quote.get("source")})
+    except Exception as exc:
+        return safe_jsonify({"ok":False,"symbol":sym,"error":str(exc)}),200
+
+
 @app.get("/api/screener/last")
 def screener_last():
     try:
@@ -4091,6 +4208,24 @@ def psx_insider_transactions():
         "note": "PSX publishes insider/director dealings through company disclosures. Filing details are shown exactly as published; quantities are not inferred from titles.",
     }
     try:
+        if CAPITAL_STAKE_API_TOKEN:
+            try:
+                path = "/insider/symbol" if symbol else "/insider"
+                body = _capital_stake_get_json(path, {"symbol": symbol} if symbol else {})
+                raw = body.get("data", []) if isinstance(body, dict) else []
+                if isinstance(raw, dict): raw = raw.get("data") or raw.get("items") or []
+                for x in raw[:limit]:
+                    tx = dict(x)
+                    typ = str(tx.get("type") or tx.get("direction") or "").lower()
+                    tx["direction"] = "buy" if "buy" in typ or "purchase" in typ else ("sell" if "sell" in typ else "disclosure")
+                    tx["title"] = tx.get("description") or f"{tx.get('type','Disclosure')} — {tx.get('name','PSX insider')}"
+                    result["transactions"].append(tx)
+                result["available"] = bool(result["transactions"])
+                result["source"] = "Capital Stake / PSX licensed insider feed"
+                result["note"] = "Genuine PSX insider transactions from the licensed Capital Stake feed, including transaction type, insider name, price and shares when published."
+                return safe_jsonify(result)
+            except Exception as licensed_exc:
+                result["licensed_error"] = str(licensed_exc)
         if symbol:
             html, source_url = _fetch_psx_html(
                 [PSX_ALT_COMPANY_URL.format(symbol=symbol), PSX_COMPANY_URL.format(symbol=symbol)],
@@ -5016,21 +5151,149 @@ def _sanitize_ohlcv(df):
     return df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
 
 
-def fetch_yahoo_psx_intraday(symbol, interval="5m", period="1d"):
-    """Fetch genuine intraday OHLCV for a PSX .KA symbol.
+def _normalize_intraday_payload(payload, symbol):
+    """Normalize common Capital Stake/JSON OHLCV response shapes."""
+    if not isinstance(payload, dict):
+        raise RuntimeError("Intraday provider returned a non-JSON payload")
+    if str(payload.get("status", "ok")).lower() == "error":
+        raise RuntimeError(str(payload.get("message") or payload.get("error") or "provider error"))
+    data = payload.get("data", payload)
+    rows = []
+    if isinstance(data, dict):
+        for key in ("candles", "bars", "ohlcv", "series", "items", "data", "rows"):
+            if isinstance(data.get(key), list):
+                rows = data[key]; break
+        if not rows and all(k in data for k in ("timestamp", "open", "high", "low", "close")):
+            rows = [data]
+    elif isinstance(data, list):
+        rows = data
+    if not rows:
+        raise RuntimeError("Intraday provider returned no OHLCV bars")
+    out=[]
+    for row in rows:
+        if isinstance(row, (list, tuple)) and len(row) >= 5:
+            ts,o,h,l,c = row[:5]; v = row[5] if len(row) > 5 else None
+        elif isinstance(row, dict):
+            ts = row.get("timestamp") or row.get("time") or row.get("datetime") or row.get("date") or row.get("t")
+            o = row.get("open") if row.get("open") is not None else row.get("o")
+            h = row.get("high") if row.get("high") is not None else row.get("h")
+            l = row.get("low") if row.get("low") is not None else row.get("l")
+            c = row.get("close") if row.get("close") is not None else row.get("c")
+            v = row.get("volume") if row.get("volume") is not None else row.get("v")
+        else:
+            continue
+        if ts is None: continue
+        try:
+            tsn=float(ts)
+            # Unix milliseconds are common in exchange APIs.
+            if tsn > 10_000_000_000: tsn /= 1000.0
+            dt=pd.to_datetime(tsn, unit="s", utc=True).tz_convert(None)
+        except Exception:
+            dt=pd.to_datetime(ts, errors="coerce", utc=True).tz_convert(None)
+        out.append({"date":dt,"open":o,"high":h,"low":l,"close":c,"volume":v})
+    df=pd.DataFrame(out, columns=["date","open","high","low","close","volume"])
+    for c in ("open","high","low","close","volume"):
+        df[c]=pd.to_numeric(df[c], errors="coerce")
+    df=df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df=_sanitize_ohlcv(df)
+    if len(df) < 5:
+        raise RuntimeError(f"Only {len(df)} valid intraday candles returned")
+    return df
 
-    Direct Yahoo Chart API is tried first. If that endpoint returns an empty
-    result (which happens for some PSX symbols/retention windows), yfinance is
-    used as a second path to the same Yahoo feed. No daily candles are ever
-    substituted for an hourly request.
+
+def fetch_capital_stake_psx_intraday(symbol, interval="5m", lookback_days=7):
+    """Fetch genuine PSX intraday OHLCV from Capital Stake when licensed.
+
+    Capital Stake documents 1m/5m/15m PSX bars and requires a Bearer token.
+    We request 5m bars and may aggregate them locally into genuine 1h/5h bars;
+    aggregation does not invent prices because every resulting OHLCV bar is
+    built from real exchange-derived source bars.
+    """
+    if not CAPITAL_STAKE_API_TOKEN:
+        raise RuntimeError("CAPITAL_STAKE_API_TOKEN is not configured")
+    interval = interval.lower()
+    if interval not in {"1m","5m","15m"}:
+        raise ValueError("Capital Stake intraday source supports 1m, 5m or 15m input bars")
+    url = CAPITAL_STAKE_API_BASE + CAPITAL_STAKE_CHART_ENDPOINT
+    headers={"Authorization":f"Bearer {CAPITAL_STAKE_API_TOKEN}","Accept":"application/json"}
+    params={"symbol":symbol.upper(),"interval":interval}
+    # APIs vary on lookback parameter names; the first documented/simple form
+    # is used, and the provider may ignore it while returning its allowed window.
+    params["days"] = int(max(1, lookback_days))
+    r=_http_session.get(url, params=params, headers=headers, timeout=20)
+    r.raise_for_status()
+    return _normalize_intraday_payload(r.json(), symbol)
+
+
+def fetch_twelve_data_psx_intraday(symbol, interval="1h", outputsize=5000):
+    """Fetch genuine PSX intraday bars from Twelve Data's XKAR coverage.
+    No interpolation/resampling is done here; the returned interval is the
+    provider's actual interval. Requires TWELVE_DATA_API_KEY.
+    """
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError("TWELVE_DATA_API_KEY is not configured")
+    td_interval={"1m":"1min","5m":"5min","15m":"15min","30m":"30min","1h":"1h","5h":"5h"}.get(interval,interval)
+    r=_http_session.get("https://api.twelvedata.com/time_series", params={
+        "symbol":symbol.upper(), "exchange":"XKAR", "interval":td_interval,
+        "outputsize":min(int(outputsize),5000), "order":"ASC", "apikey":TWELVE_DATA_API_KEY,
+        "timezone":"UTC",
+    }, headers={"Accept":"application/json"}, timeout=20)
+    r.raise_for_status(); body=r.json()
+    if body.get("status")=="error" or body.get("code"):
+        raise RuntimeError(str(body.get("message") or body.get("code") or "Twelve Data error"))
+    values=body.get("values") or []
+    if not values: raise RuntimeError("Twelve Data returned no intraday bars")
+    rows=[]
+    for x in values:
+        rows.append({"date":pd.to_datetime(x.get("datetime"),errors="coerce",utc=True).tz_convert(None),
+                     "open":x.get("open"),"high":x.get("high"),"low":x.get("low"),"close":x.get("close"),"volume":x.get("volume")})
+    df=pd.DataFrame(rows);
+    for c in ("open","high","low","close","volume"): df[c]=pd.to_numeric(df[c],errors="coerce")
+    df=_sanitize_ohlcv(df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
+    if len(df)<5: raise RuntimeError(f"Twelve Data returned only {len(df)} valid candles")
+    df.attrs["source"]="Twelve Data / XKAR"; df.attrs["source_interval"]=interval
+    return df
+
+
+def fetch_yahoo_psx_intraday(symbol, interval="5m", period="1d"):
+    """Fetch genuine PSX intraday OHLCV with a strict no-fake source chain.
+
+    Preferred source: licensed Capital Stake 5m exchange-derived bars when
+    CAPITAL_STAKE_API_TOKEN is configured. Fallback: Yahoo's genuine 60m/
+    intraday feed. If neither source has real intraday bars, the function
+    raises an error; it NEVER substitutes daily candles.
     """
     symbol = symbol.upper().strip()
     allowed = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
     if interval not in allowed:
         raise ValueError(f"Unsupported intraday interval: {interval}")
-    yahoo_interval = "60m" if interval == "1h" else interval
-    errors = []
+    errors=[]
 
+    # Capital Stake is the preferred genuine PSX source for this app because
+    # it is an authorized PSX vendor and exposes exchange-derived intraday bars.
+    if CAPITAL_STAKE_API_TOKEN and interval in {"1h", "5h", "5m", "15m"}:
+        try:
+            # 5m is used as the primitive bar for exact 1h aggregation.
+            df=fetch_capital_stake_psx_intraday(symbol, "5m", lookback_days=7)
+            df.attrs["source"]="Capital Stake / PSX licensed feed"; df.attrs["source_interval"]="5m"
+            return df
+        except Exception as exc:
+            errors.append(f"Capital Stake: {exc}")
+
+    # Twelve Data has explicit PSX/XKAR coverage and supports genuine 1h
+    # time series. Use it before Yahoo when configured.
+    if TWELVE_DATA_API_KEY and interval in {"1h","5h","15m","5m","1m"}:
+        try:
+            td_interval = "1h" if interval == "5h" else interval
+            df = fetch_twelve_data_psx_intraday(symbol, td_interval, outputsize=5000)
+            if interval == "5h":
+                df = _group_intraday_hours(df, 5)
+                df.attrs["source"] = "Twelve Data / XKAR"; df.attrs["source_interval"] = "5h"
+            return df
+        except Exception as exc:
+            errors.append(f"Twelve Data: {exc}")
+
+    yahoo_interval = "60m" if interval in {"1h","5h"} else interval
     try:
         response = _http_session.get(
             YAHOO_CHART_URL.format(symbol=symbol),
@@ -5038,56 +5301,46 @@ def fetch_yahoo_psx_intraday(symbol, interval="5m", period="1d"):
             headers={**HEADERS, "Accept": "application/json,text/plain,*/*"}, timeout=20,
         )
         response.raise_for_status()
-        payload = response.json()
-        chart = payload.get("chart") or {}
+        payload=response.json(); chart=payload.get("chart") or {}
         if chart.get("error"):
             raise RuntimeError(str(chart["error"].get("description") or chart["error"]))
-        result = (chart.get("result") or [None])[0]
-        if not result:
-            raise RuntimeError("Yahoo Chart returned no result")
-        ts = result.get("timestamp") or []
-        quote = ((result.get("indicators") or {}).get("quote") or [None])[0] or {}
-        if not ts or not quote:
-            raise RuntimeError("Yahoo Chart returned no intraday OHLCV")
-        df = pd.DataFrame({
-            "date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
-            "open": quote.get("open", []), "high": quote.get("high", []),
-            "low": quote.get("low", []), "close": quote.get("close", []),
-            "volume": quote.get("volume", []),
-        })
-        for c in ("open", "high", "low", "close", "volume"):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = _sanitize_ohlcv(df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
-        if len(df) >= 5:
-            return df
+        result=(chart.get("result") or [None])[0]
+        if not result: raise RuntimeError("Yahoo Chart returned no result")
+        ts=result.get("timestamp") or []
+        quote=((result.get("indicators") or {}).get("quote") or [None])[0] or {}
+        if not ts or not quote: raise RuntimeError("Yahoo Chart returned no intraday OHLCV")
+        df=pd.DataFrame({"date":pd.to_datetime(ts,unit="s",utc=True).tz_convert(None),
+                         "open":quote.get("open",[]),"high":quote.get("high",[]),
+                         "low":quote.get("low",[]),"close":quote.get("close",[]),"volume":quote.get("volume",[])})
+        for c in ("open","high","low","close","volume"): df[c]=pd.to_numeric(df[c],errors="coerce")
+        df=_sanitize_ohlcv(df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
+        if len(df)>=5: return df
         errors.append(f"Yahoo Chart returned only {len(df)} valid candles")
     except Exception as exc:
         errors.append(f"Yahoo Chart: {exc}")
 
+    # yfinance is another client for the same Yahoo source, so it is a client
+    # fallback rather than a second data vendor.
     try:
         import yfinance as yf
-        df = yf.download(f"{symbol}.KA", interval=yahoo_interval, period=period,
-                         progress=False, auto_adjust=False, threads=False)
+        df=yf.download(f"{symbol}.KA", interval=yahoo_interval, period=period, progress=False, auto_adjust=False, threads=False)
         if df is not None and not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            df = df.reset_index()
-            first = df.columns[0]
-            df = df.rename(columns={first: "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-            for c in ("open", "high", "low", "close", "volume"):
-                if c not in df.columns: df[c] = None
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.tz_convert(None)
-            df = _sanitize_ohlcv(df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
-            if len(df) >= 5:
+            if isinstance(df.columns,pd.MultiIndex): df.columns=[c[0] if isinstance(c,tuple) else c for c in df.columns]
+            df=df.reset_index(); first=df.columns[0]
+            df=df.rename(columns={first:"date","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+            for c in ("open","high","low","close","volume"):
+                if c not in df.columns: df[c]=None
+                df[c]=pd.to_numeric(df[c],errors="coerce")
+            df["date"]=pd.to_datetime(df["date"],errors="coerce",utc=True).dt.tz_convert(None)
+            df=_sanitize_ohlcv(df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
+            if len(df)>=5:
+                df.attrs["source"]="Yahoo Finance via yfinance"; df.attrs["source_interval"]=interval if interval not in {"1h","5h"} else "1h"
                 return df
             errors.append(f"yfinance returned only {len(df)} valid candles")
-        else:
-            errors.append("yfinance returned no data")
+        else: errors.append("yfinance returned no data")
     except Exception as exc:
         errors.append(f"yfinance: {exc}")
-
-    raise RuntimeError("; ".join(errors[-3:]))
+    raise RuntimeError("; ".join(errors[-4:]))
 
 
 def fetch_yahoo_psx_history(symbol, period="max"):
@@ -6210,6 +6463,22 @@ def _group_ohlc_by_trading_days(df, days_per_candle=5):
     out["date"] = d.groupby(groups, sort=True)["date"].last().values
     return out[["date", "open", "high", "low", "close", "volume"]]
 
+def _group_intraday_to_hour_bars(df):
+    """Aggregate genuine 5-minute exchange bars into genuine 1-hour OHLCV bars.
+    The resulting bars are exact OHLCV aggregates of source bars, never price
+    interpolation. Session boundaries are kept separate in PKT.
+    """
+    if df is None or df.empty: return df
+    d=df.sort_values("date").copy()
+    local=pd.to_datetime(d["date"],utc=True).dt.tz_convert("Asia/Karachi")
+    d["_session"]=local.dt.date.astype(str)
+    d["_bucket"]=local.dt.floor("h")
+    agg={"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+    out=d.groupby(["_session","_bucket"],sort=True).agg(agg).reset_index()
+    out["date"]=pd.to_datetime(out["_bucket"],utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+    return out[["date","open","high","low","close","volume"]].sort_values("date").reset_index(drop=True)
+
+
 def _group_intraday_hours(df, hours_per_candle=5):
     """Aggregate 1-hour candles into N-hour candles without combining two
     separate PSX trading sessions. A normal PSX session therefore produces
@@ -6257,6 +6526,9 @@ def stock_chart(symbol):
             # that would silently turn an hourly chart into a daily chart.
             chart_df = fetch_yahoo_psx_intraday(symbol, "1h", cfg.get("intraday_period", "730d"))
             chart_df = _sanitize_ohlcv(chart_df)
+            source_interval = chart_df.attrs.get("source_interval", "1h") if hasattr(chart_df, "attrs") else "1h"
+            if source_interval == "5m":
+                chart_df = _group_intraday_to_hour_bars(chart_df)
             if cfg.get("aggregate_hours"):
                 chart_df = _group_intraday_hours(chart_df, cfg["aggregate_hours"])
             else:
@@ -6271,7 +6543,7 @@ def stock_chart(symbol):
             return safe_jsonify({
                 "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
                 "candle_interval": "5h" if cfg.get("aggregate_hours") else "1h",
-                "data_source": "Yahoo Finance PSX .KA · real hourly OHLCV",
+                "data_source": str(chart_df.attrs.get("source") or "Genuine intraday OHLCV provider"),
                 "history_span": f"{len(chart_df)} candles",
                 "candles": candles, "volume": volume, "indicators": indicators,
                 "pivot_points": {\

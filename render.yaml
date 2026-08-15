@@ -9,3 +9,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
+
+# Set these in Render Environment, not in source control:
+# CAPITAL_STAKE_API_TOKEN=<licensed Capital Stake token>
+# TWELVE_DATA_API_KEY=<optional Twelve Data key with XKAR coverage>
