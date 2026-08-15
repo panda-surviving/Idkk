@@ -1,0 +1,22 @@
+[
+  "tests/test_regression_static.py::test_chart_monthly_resample_is_pandas_compatible",
+  "tests/test_regression_static.py::test_full_scan_never_uses_ten_symbol_fallback",
+  "tests/test_regression_static.py::test_indicator_values_and_pivots_are_rendered",
+  "tests/test_regression_static.py::test_psx_historical_request_has_required_parameters",
+  "tests/test_regression_static.py::test_real_history_fallbacks_exist",
+  "tests/test_regression_static.py::test_service_worker_cache_is_bumped",
+  "tests/test_v10_regressions.py::test_chart_ranges_are_true_ranges",
+  "tests/test_v10_regressions.py::test_divergence_tables_include_volume",
+  "tests/test_v10_regressions.py::test_fundamental_values_are_not_forced_to_vendor_placeholders",
+  "tests/test_v10_regressions.py::test_insider_transactions_section_and_api",
+  "tests/test_v10_regressions.py::test_psx_closed_market_status_and_last_session",
+  "tests/test_v7_static.py::test_announcement_feed_has_multiple_official_streams",
+  "tests/test_v7_static.py::test_chart_timeframes_use_explicit_candle_intervals",
+  "tests/test_v7_static.py::test_divergence_progress_has_real_universe_before_callback",
+  "tests/test_v7_static.py::test_divergence_scans_multiple_recent_pivot_pairs",
+  "tests/test_v7_static.py::test_intraday_chart_timeframes_are_wired",
+  "tests/test_v7_static.py::test_market_wide_quote_path_is_official_screener_not_dev_subset",
+  "tests/test_v7_static.py::test_multi_timeframe_setup_uses_matching_timeframe",
+  "tests/test_v7_static.py::test_personalized_setup_is_a_real_conjunction",
+  "tests/test_v7_static.py::test_quote_path_never_returns_legacy_development_prices"
+]

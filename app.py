@@ -1795,6 +1795,13 @@ def parse_company_page(symbol, html):
         "shares_outstanding": None,
         "free_float_shares": None,
         "free_float_pct": None,
+        "face_value": None,
+        "dividend_per_share": None,
+        "dividend_payout_pct": None,
+        "debt_to_equity": None,
+        "current_ratio": None,
+        "return_on_equity_pct": None,
+        "return_on_assets_pct": None,
     }
 
     # PSX company pages expose real financial tables. Extract the latest
@@ -1829,6 +1836,53 @@ def parse_company_page(symbol, html):
                 quote["book_value_per_share"] = nums[0]
             elif ("price to book" in label or "p/b" in label) and nums and quote["price_to_book"] is None:
                 quote["price_to_book"] = nums[0]
+            elif ("dividend per share" in label or "cash dividend per share" in label or label == "dividend") and nums and quote["dividend_per_share"] is None:
+                quote["dividend_per_share"] = nums[0]
+            elif ("dividend payout" in label or "payout ratio" in label) and nums and quote["dividend_payout_pct"] is None:
+                quote["dividend_payout_pct"] = nums[0]
+            elif ("debt to equity" in label or "debt/equity" in label or "d/e" in label) and nums and quote["debt_to_equity"] is None:
+                quote["debt_to_equity"] = nums[0]
+            elif "current ratio" in label and nums and quote["current_ratio"] is None:
+                quote["current_ratio"] = nums[0]
+            elif ("return on equity" in label or "roe" == label) and nums and quote["return_on_equity_pct"] is None:
+                quote["return_on_equity_pct"] = nums[0]
+            elif ("return on assets" in label or "roa" == label) and nums and quote["return_on_assets_pct"] is None:
+                quote["return_on_assets_pct"] = nums[0]
+
+    # Some PSX pages render ratios as plain label/value text instead of
+    # semantic table rows. These fallbacks only parse values that are actually
+    # printed by the source page; missing fields remain null.
+    def first_label_value(patterns):
+        for pat in patterns:
+            val = _number(_search(text, pat))
+            if val is not None:
+                return val
+        return None
+
+    if quote["book_value_per_share"] is None:
+        quote["book_value_per_share"] = first_label_value([
+            r'Break[\- ]?up Value(?:\s*/\s*Share)?\s*([\d,.]+)',
+            r'Book Value(?:\s*/\s*Share)?\s*([\d,.]+)',
+            r'Book Value Per Share\s*([\d,.]+)',
+        ])
+    if quote["price_to_book"] is None:
+        quote["price_to_book"] = first_label_value([r'Price\s*(?:/|to)\s*Book\s*([\d,.]+)', r'P\s*/\s*B\s*([\d,.]+)'])
+    if quote["dividend_yield_pct"] is None:
+        quote["dividend_yield_pct"] = first_label_value([r'Dividend Yield\s*([\d,.]+)\s*%?', r'Dividend Yield %\s*([\d,.]+)'])
+    if quote["dividend_per_share"] is None:
+        quote["dividend_per_share"] = first_label_value([r'Dividend Per Share\s*([\d,.]+)', r'Cash Dividend Per Share\s*([\d,.]+)'])
+    if quote["face_value"] is None:
+        quote["face_value"] = first_label_value([r'Face Value\s*([\d,.]+)'])
+    if quote["dividend_payout_pct"] is None:
+        quote["dividend_payout_pct"] = first_label_value([r'Dividend Payout(?: Ratio)?\s*([\d,.]+)\s*%?'])
+    if quote["debt_to_equity"] is None:
+        quote["debt_to_equity"] = first_label_value([r'Debt\s*(?:/|to)\s*Equity\s*([\d,.]+)'])
+    if quote["current_ratio"] is None:
+        quote["current_ratio"] = first_label_value([r'Current Ratio\s*([\d,.]+)'])
+    if quote["return_on_equity_pct"] is None:
+        quote["return_on_equity_pct"] = first_label_value([r'Return on Equity(?:\s*\(ROE\))?\s*([\d,.]+)\s*%?'])
+    if quote["return_on_assets_pct"] is None:
+        quote["return_on_assets_pct"] = first_label_value([r'Return on Assets(?:\s*\(ROA\))?\s*([\d,.]+)\s*%?'])
 
     # Equity-profile values are usually rendered as label/value text rather
     # than table rows.
@@ -2375,6 +2429,34 @@ def start_bulk_refresh_thread():
 # Fundamentals (best-effort, from the same PSX company page)
 # ---------------------------------------------------------
 
+def _stock_volume_periods(symbol):
+    """Return source-backed daily volume totals for the latest session,
+    latest 5 trading sessions and latest ~21 trading sessions. These are
+    calculated from the same real daily OHLCV history used by the charts,
+    never invented or copied from a different timeframe."""
+    try:
+        df = get_full_history_cached(symbol)
+    except Exception:
+        return {"volume_1d": None, "volume_1w": None, "volume_1m": None,
+                "avg_volume_1w": None, "avg_volume_1m": None}
+    if df is None or df.empty or "volume" not in df.columns:
+        return {"volume_1d": None, "volume_1w": None, "volume_1m": None,
+                "avg_volume_1w": None, "avg_volume_1m": None}
+    v = pd.to_numeric(df["volume"], errors="coerce").dropna()
+    if v.empty:
+        return {"volume_1d": None, "volume_1w": None, "volume_1m": None,
+                "avg_volume_1w": None, "avg_volume_1m": None}
+    last1 = v.tail(1)
+    last5 = v.tail(5)
+    last21 = v.tail(21)
+    return {
+        "volume_1d": int(last1.sum()),
+        "volume_1w": int(last5.sum()),
+        "volume_1m": int(last21.sum()),
+        "avg_volume_1w": int(last5.mean()),
+        "avg_volume_1m": int(last21.mean()),
+    }
+
 def get_fundamentals(symbol):
     """Return source-backed PSX fundamentals and calculated TTM values.
 
@@ -2401,6 +2483,8 @@ def get_fundamentals(symbol):
         except (TypeError, ValueError):
             eps_ttm = None
 
+    volume_periods = _stock_volume_periods(symbol)
+
     return {
         "symbol": symbol.upper(),
         "company": quote.get("company"),
@@ -2414,6 +2498,7 @@ def get_fundamentals(symbol):
         "week52_range": [quote.get("low52"), quote.get("high52")],
         "volume": quote.get("volume"),
         "volume_30d_avg": quote.get("volume_30d_avg"),
+        **volume_periods,
         "eps_ttm": eps_ttm,
         "eps_latest_annual": annual_eps,
         "eps_quarterly": q_eps,
@@ -2424,13 +2509,20 @@ def get_fundamentals(symbol):
         "shares_outstanding": quote.get("shares_outstanding"),
         "free_float_shares": quote.get("free_float_shares"),
         "free_float_pct": quote.get("free_float_pct"),
+        "face_value": quote.get("face_value"),
+        "dividend_per_share": quote.get("dividend_per_share"),
+        "dividend_payout_pct": quote.get("dividend_payout_pct"),
+        "debt_to_equity": quote.get("debt_to_equity"),
+        "current_ratio": quote.get("current_ratio"),
+        "return_on_equity_pct": quote.get("return_on_equity_pct"),
+        "return_on_assets_pct": quote.get("return_on_assets_pct"),
         "dividend_history": [],
         "source": quote.get("source"),
         "note": (
             "Fundamental values are read from the PSX company page when that "
             "field is actually published there. EPS is shown from PSX financial "
-            "tables; dividend yield/book value remain unavailable for issuers "
-            "where PSX does not publish the corresponding field on the page."
+            "tables; book value, dividend and ratio fields are shown whenever PSX publishes them. "
+            "Volume totals are calculated from the latest available daily OHLCV history."
         ),
     }
 
@@ -5886,13 +5978,14 @@ def stock_verdict(symbol):
 # toggles) is served from the already-fetched DataFrame.
 
 CHART_TIMEFRAME_CONFIG = {
-    # Range buttons are true ranges, not long historical windows mislabeled
-    # as intervals. 1H/5H use 5-minute candles; 1D uses 15-minute candles;
-    # 5D uses 30-minute candles. Longer buttons remain daily-history ranges.
-    "1H": {"intraday_interval": "5m", "intraday_period": "1d", "range_hours": 1, "label": "1H · 5m"},
-    "5H": {"intraday_interval": "5m", "intraday_period": "5d", "range_hours": 5, "label": "5H · 5m"},
-    "1D": {"intraday_interval": "15m", "intraday_period": "5d", "session_only": True, "label": "1D · 15m"},
-    "5D": {"intraday_interval": "30m", "intraday_period": "60d", "range_hours": 24 * 5, "label": "5D · 30m"},
+    # The button name describes the displayed range, while the candle
+    # interval is explicit and never silently substituted.  1H/5H use real
+    # one-hour candles.  1D/5D use real daily candles.  Longer ranges remain
+    # daily/weekly/monthly historical bars.
+    "1H": {"intraday_interval": "1h", "intraday_period": "5d", "range_hours": 24, "label": "1H · 1h candles", "minimum_bars": 2},
+    "5H": {"intraday_interval": "1h", "intraday_period": "5d", "range_hours": 5, "label": "5H · 1h candles", "minimum_bars": 2},
+    "1D": {"daily_period": "3mo", "range_days": 30, "label": "1D · 1D candles", "minimum_bars": 2},
+    "5D": {"daily_period": "3mo", "range_days": 5, "label": "5D · 1D candles", "minimum_bars": 2},
     "1M": {"days": 35, "resample": None},
     "3M": {"days": 95, "resample": None},
     "6M": {"days": 190, "resample": None},
@@ -5979,53 +6072,78 @@ def stock_chart(symbol):
         return guard
 
     timeframe = request.args.get("timeframe", "1Y").upper()
-    cfg = CHART_TIMEFRAME_CONFIG.get(timeframe, CHART_TIMEFRAME_CONFIG["1Y"])
+    cfg = dict(CHART_TIMEFRAME_CONFIG.get(timeframe, CHART_TIMEFRAME_CONFIG["1Y"]))
+    minimum = int(cfg.get("minimum_bars", CHART_MIN_CANDLES))
 
-    cfg = dict(cfg)
-    intraday = bool(cfg.get("intraday_interval"))
-    if intraday:
+    # Intraday: 1H and 5H are genuinely one-hour candles. We request a
+    # multi-day retention window from Yahoo and then slice only the requested
+    # display range. This avoids the old 5-minute candles being mislabeled as
+    # 1H and also gives a useful number of bars when the market is closed.
+    if cfg.get("intraday_interval"):
         try:
             chart_df = fetch_yahoo_psx_intraday(symbol, cfg["intraday_interval"], cfg["intraday_period"])
         except Exception as e:
             return safe_jsonify({
                 "available": False, "symbol": symbol.upper(), "timeframe": timeframe,
-                "note": f"Intraday data is not currently available for this PSX symbol from the supported live feed: {e}",
+                "note": f"1-hour PSX candles are not currently available from the supported live feed: {e}",
             })
-        if chart_df is None or chart_df.empty or len(chart_df) < CHART_MIN_CANDLES:
-            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "Not enough live intraday candles for this timeframe."})
-        # Yahoo returns the provider's full requested retention window. Slice
-        # it to the actual button range so 1H can never render 60 days of
-        # hourly candles and 1D can never masquerade as a multi-day chart.
-        if cfg.get("session_only"):
-            latest_day = chart_df["date"].dt.date.max()
-            chart_df = chart_df[chart_df["date"].dt.date == latest_day].copy()
-        elif cfg.get("range_hours"):
-            latest_ts = chart_df["date"].max()
-            cutoff = latest_ts - pd.Timedelta(hours=float(cfg["range_hours"]))
-            chart_df = chart_df[chart_df["date"] >= cutoff].copy()
+        if chart_df is None or chart_df.empty:
+            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No one-hour candles were returned by the supported live feed."})
+        latest_ts = chart_df["date"].max()
+        cutoff = latest_ts - pd.Timedelta(hours=float(cfg["range_hours"]))
+        chart_df = chart_df[chart_df["date"] >= cutoff].copy()
         chart_df = _sanitize_ohlcv(chart_df)
-        if len(chart_df) < CHART_MIN_CANDLES:
-            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Not enough candles for {cfg.get('label', timeframe)} from the supported live feed."})
+        if len(chart_df) < minimum:
+            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Not enough {cfg['label']} were returned by the supported live feed."})
         candles, volume = _ohlc_to_candles_and_volume(chart_df, intraday=True)
         indicators = compute_chart_indicator_series(chart_df, intraday=True)
-        # For intraday charts, support/resistance uses the last completed
-        # daily session from the reliable daily-history cache.
         try:
             full_df = get_full_history_cached(symbol)
         except Exception:
             full_df = None
-        if full_df is not None and not full_df.empty:
-            full_df = full_df.sort_values("date").reset_index(drop=True)
-        else:
+        if full_df is None or full_df.empty:
             full_df = chart_df
+        full_df = full_df.sort_values("date").reset_index(drop=True)
         completed = full_df[full_df["date"].dt.date < date.today()]
         pivot_row = completed.iloc[-1] if not completed.empty else full_df.iloc[-1]
-        pivot_high = float(pivot_row["high"]) if "high" in full_df.columns and pd.notna(pivot_row["high"]) else float(pivot_row["close"])
-        pivot_low = float(pivot_row["low"]) if "low" in full_df.columns and pd.notna(pivot_row["low"]) else float(pivot_row["close"])
+        pivot_high = float(pivot_row["high"]) if pd.notna(pivot_row.get("high")) else float(pivot_row["close"])
+        pivot_low = float(pivot_row["low"]) if pd.notna(pivot_row.get("low")) else float(pivot_row["close"])
         pivot_close = float(pivot_row["close"])
         return safe_jsonify({
             "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
-            "data_source": f"Yahoo Finance PSX .KA intraday ({cfg['label']})",
+            "candle_interval": "1h", "data_source": "Yahoo Finance PSX .KA · 1-hour OHLCV",
+            "candles": candles, "volume": volume, "indicators": indicators,
+            "pivot_points": {
+                "classic": compute_pivot_points(pivot_high, pivot_low, pivot_close),
+                "fibonacci": compute_fibonacci_pivot_points(pivot_high, pivot_low, pivot_close),
+                "basis_date": pivot_row["date"].date().isoformat() if pd.notna(pivot_row["date"]) else None,
+            },
+        })
+
+    # 1D/5D are deliberately daily candles, not 15m/30m intraday bars.
+    if cfg.get("daily_period"):
+        try:
+            chart_df = get_full_history_cached(symbol)
+        except Exception as e:
+            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Daily PSX history is not currently available: {e}"})
+        if chart_df is None or chart_df.empty:
+            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No daily PSX history is available for this symbol."})
+        chart_df = chart_df.sort_values("date").reset_index(drop=True)
+        if cfg.get("range_days") is not None:
+            chart_df = chart_df.tail(max(int(cfg["range_days"]), minimum)).copy()
+        chart_df = _sanitize_ohlcv(chart_df)
+        if len(chart_df) < minimum:
+            return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Not enough daily candles for {cfg['label']}."})
+        candles, volume = _ohlc_to_candles_and_volume(chart_df, intraday=False)
+        indicators = compute_chart_indicator_series(chart_df, intraday=False)
+        completed = chart_df[chart_df["date"].dt.date < date.today()]
+        pivot_row = completed.iloc[-1] if not completed.empty else chart_df.iloc[-1]
+        pivot_high = float(pivot_row["high"]) if pd.notna(pivot_row["high"]) else float(pivot_row["close"])
+        pivot_low = float(pivot_row["low"]) if pd.notna(pivot_row["low"]) else float(pivot_row["close"])
+        pivot_close = float(pivot_row["close"])
+        return safe_jsonify({
+            "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
+            "candle_interval": "1d", "data_source": "PSX-compatible daily OHLCV history · 1-day candles",
             "candles": candles, "volume": volume, "indicators": indicators,
             "pivot_points": {
                 "classic": compute_pivot_points(pivot_high, pivot_low, pivot_close),
@@ -6037,19 +6155,14 @@ def stock_chart(symbol):
     try:
         full_df = get_full_history_cached(symbol)
     except Exception as e:
-        return safe_jsonify({"available": False, "symbol": symbol.upper(), "note": f"Could not load chart data: {e}"})
-
+        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Could not load chart data: {e}"})
     if full_df is None or full_df.empty:
-        return safe_jsonify({"available": False, "symbol": symbol.upper(), "note": "No price history is available for this symbol from PSX."})
-
+        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No price history is available for this symbol from PSX."})
     full_df = full_df.sort_values("date").reset_index(drop=True)
-
-    # Support/resistance is based on the most recent COMPLETED daily bar,
-    # regardless of which timeframe the chart itself is showing.
     completed = full_df[full_df["date"].dt.date < date.today()]
     pivot_row = completed.iloc[-1] if not completed.empty else full_df.iloc[-1]
-    pivot_high = float(pivot_row["high"]) if "high" in full_df.columns and pd.notna(pivot_row["high"]) else float(pivot_row["close"])
-    pivot_low = float(pivot_row["low"]) if "low" in full_df.columns and pd.notna(pivot_row["low"]) else float(pivot_row["close"])
+    pivot_high = float(pivot_row["high"]) if pd.notna(pivot_row["high"]) else float(pivot_row["close"])
+    pivot_low = float(pivot_row["low"]) if pd.notna(pivot_row["low"]) else float(pivot_row["close"])
     pivot_close = float(pivot_row["close"])
 
     if cfg["days"] is not None:
@@ -6057,24 +6170,17 @@ def stock_chart(symbol):
         windowed = full_df[full_df["date"] >= cutoff].reset_index(drop=True)
     else:
         windowed = full_df
-
     chart_df = resample_ohlc(windowed, cfg["resample"]) if cfg["resample"] else windowed
-
     if chart_df is None or chart_df.empty or len(chart_df) < CHART_MIN_CANDLES:
-        return safe_jsonify({"available": False, "symbol": symbol.upper(), "note": "Not enough price history for this timeframe yet."})
-
+        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "Not enough price history for this timeframe yet."})
     chart_df = _sanitize_ohlcv(chart_df)
     candles, volume = _ohlc_to_candles_and_volume(chart_df, intraday=False)
     indicators = compute_chart_indicator_series(chart_df, intraday=False)
-
     return safe_jsonify({
-        "available": True,
-        "symbol": symbol.upper(),
-        "timeframe": timeframe,
+        "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
+        "candle_interval": "1d" if not cfg.get("resample") else cfg["resample"].lower(),
         "data_source": "PSX-compatible historical OHLCV provider chain (real market data)",
-        "candles": candles,
-        "volume": volume,
-        "indicators": indicators,
+        "candles": candles, "volume": volume, "indicators": indicators,
         "pivot_points": {
             "classic": compute_pivot_points(pivot_high, pivot_low, pivot_close),
             "fibonacci": compute_fibonacci_pivot_points(pivot_high, pivot_low, pivot_close),

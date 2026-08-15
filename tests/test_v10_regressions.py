@@ -11,15 +11,18 @@ def test_chart_ranges_are_true_ranges():
     app = read("app.py")
     js = read("static/app.js")
     html = read("templates/index.html")
-    assert '"1H": {"intraday_interval": "5m"' in app
-    assert '"5H": {"intraday_interval": "5m"' in app
-    assert '"1D": {"intraday_interval": "15m"' in app
-    assert '"5D": {"intraday_interval": "30m"' in app
+    assert '"1H": {"intraday_interval": "1h"' in app
+    assert '"5H": {"intraday_interval": "1h"' in app
+    assert '"1D": {"daily_period": "3mo"' in app
+    assert '"5D": {"daily_period": "3mo"' in app
+    assert '"candle_interval": "1h"' in app
+    assert '"candle_interval": "1d"' in app
     assert 'data-tf="5H"' in html
     assert 'range_hours' in app
-    assert 'session_only' in app
-    assert '1H can never render 60 days' in app
+    assert 'range_hours' in app
+    assert 'one-hour candles' in app
     assert 'd.timeframe || currentChartTimeframe' in js
+    assert 'd.candle_interval' in js
 
 def test_psx_closed_market_status_and_last_session():
     app = read("app.py")

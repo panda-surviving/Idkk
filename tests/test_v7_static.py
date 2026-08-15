@@ -21,10 +21,13 @@ def test_personalized_setup_is_a_real_conjunction():
     assert 'bearish_setup = bool(any(tf_setup_ok(hit, "bearish") for hit in bearish_tf_hits) and ha_color == "red")' in APP
 
 
-def test_intraday_chart_timeframes_are_wired():
-    assert '"1D": {"intraday_interval": "15m", "intraday_period": "5d"' in APP
-    assert '"5D": {"intraday_interval": "30m", "intraday_period": "60d"' in APP
-    assert '"1H": {"intraday_interval": "5m", "intraday_period": "1d"' in APP
+def test_chart_timeframes_use_explicit_candle_intervals():
+    assert '"1H": {"intraday_interval": "1h"' in APP
+    assert '"5H": {"intraday_interval": "1h"' in APP
+    assert '"1D": {"daily_period": "3mo"' in APP
+    assert '"5D": {"daily_period": "3mo"' in APP
+    assert '"candle_interval": "1h"' in APP
+    assert '"candle_interval": "1d"' in APP
     assert 'data-tf="1D"' in HTML and 'data-tf="1H"' in HTML
 
 
@@ -49,7 +52,7 @@ def test_announcement_feed_has_multiple_official_streams():
     assert 'CDC Notices' in APP
     assert 'NCCPL Notices' in APP
     assert 'Payouts' in APP
-    assert 'psx-360-shell-v7' in SW
+    assert 'psx-360-shell-v11' in SW
 
 
 def test_divergence_scans_multiple_recent_pivot_pairs():

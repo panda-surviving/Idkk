@@ -1417,8 +1417,19 @@ async function loadFundamentals(symbol) {
       metric("Book Value / Share", f.book_value_per_share == null ? null : Number(f.book_value_per_share).toFixed(2)) +
       metric("P/B", f.price_to_book == null ? null : Number(f.price_to_book).toFixed(2)) +
       metric("Dividend Yield", f.dividend_yield_pct == null ? null : `${Number(f.dividend_yield_pct).toFixed(2)}%`) +
-      metric("Volume", f.volume == null ? null : Number(f.volume).toLocaleString()) +
+      metric("1D Volume", f.volume_1d == null ? null : Number(f.volume_1d).toLocaleString()) +
+      metric("1W Volume", f.volume_1w == null ? null : Number(f.volume_1w).toLocaleString()) +
+      metric("1M Volume", f.volume_1m == null ? null : Number(f.volume_1m).toLocaleString()) +
+      metric("1W Avg Volume", f.avg_volume_1w == null ? null : Number(f.avg_volume_1w).toLocaleString()) +
+      metric("1M Avg Volume", f.avg_volume_1m == null ? null : Number(f.avg_volume_1m).toLocaleString()) +
       metric("30D Avg Volume", f.volume_30d_avg == null ? null : Number(f.volume_30d_avg).toLocaleString()) +
+      metric("Face Value", f.face_value == null ? null : Number(f.face_value).toFixed(2)) +
+      metric("Dividend / Share", f.dividend_per_share == null ? null : Number(f.dividend_per_share).toFixed(2)) +
+      metric("Payout Ratio", f.dividend_payout_pct == null ? null : `${Number(f.dividend_payout_pct).toFixed(2)}%`) +
+      metric("Debt / Equity", f.debt_to_equity == null ? null : Number(f.debt_to_equity).toFixed(2)) +
+      metric("Current Ratio", f.current_ratio == null ? null : Number(f.current_ratio).toFixed(2)) +
+      metric("ROE", f.return_on_equity_pct == null ? null : `${Number(f.return_on_equity_pct).toFixed(2)}%`) +
+      metric("ROA", f.return_on_assets_pct == null ? null : `${Number(f.return_on_assets_pct).toFixed(2)}%`) +
       metric("Free Float", f.free_float_pct == null ? null : `${Number(f.free_float_pct).toFixed(2)}%`);
 
     if (f.pe_ratio_ttm != null) {
@@ -3414,7 +3425,7 @@ async function loadDashboardTickers() {
       .map(f => ({ symbol: f.name.slice(0, 22), price: Number(f.nav).toFixed(2), pct: Number(f.ytd || 0) }));
 
     $("globalTickerBar").innerHTML = [
-      psxItems.length ? buildTickerStrip(psxLabel, psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">${esc(psxLabel)}</span><span class="ticker-item">${esc(psxStatus.label || "Waiting for the latest PSX snapshot…")}</span></div>`,
+      psxItems.length ? buildTickerStrip(psxLabel, psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">${esc(psxLabel)}</span></div>`,
       cryptoItems.length ? buildTickerStrip("CRYPTO LIVE", cryptoItems) : "",
       forexItems.length ? buildTickerStrip("FOREX LIVE", forexItems) : "",
       fundItems.length ? buildTickerStrip("MUTUAL FUNDS", fundItems) : "",
@@ -4104,7 +4115,9 @@ async function loadStockChart(symbol, timeframe) {
       ["mainPriceChart", "volumeChart", "rsiChart", "macdChart"].forEach(id => { if ($(id)) $(id).innerHTML = ""; });
       return;
     }
-    statusEl.textContent = d.data_source ? `${d.data_source} · ${d.timeframe || currentChartTimeframe}` : "";
+    statusEl.textContent = d.data_source
+      ? `${d.data_source} · ${d.timeframe || currentChartTimeframe}${d.candle_interval ? ` · ${d.candle_interval} candles` : ""}`
+      : "";
     lastChartData = d;
     // Render on the next paint so the stock-detail page has a real width
     // after navigation; Lightweight Charts otherwise initializes at 0px on
