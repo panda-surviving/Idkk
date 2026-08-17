@@ -185,7 +185,7 @@ _mufap_refresh_lock = threading.Lock()
 MUFAP_CACHE_MINUTES = 30
 MUFAP_NAV_URL = "https://www.mufap.com.pk/Industry/IndustryStatDaily?tab=3"
 PSX_BULK_SCREENER_URL = "https://dps.psx.com.pk/screener"
-PSX_BULK_ALLSHR_URL = "https://dps.psx.com.pk/indices/ALLSHR"
+PSX_BULK_MARKET_WATCH_URL = "https://dps.psx.com.pk/market-watch"
 PSX_BULK_SNAPSHOT_CACHE_MINUTES = 5
 
 # Crypto: CoinGecko's public markets endpoint needs no API key for
@@ -2303,24 +2303,33 @@ def fetch_psx_bulk_snapshot():
 
     allshr_rows={}
     try:
-        r=_http_session.get(PSX_BULK_ALLSHR_URL, headers=HEADERS, timeout=25)
+        # IMPORTANT: the old V8 endpoint /indices/ALLSHR is an index page,
+        # not a stock quote table. It therefore could not supply the
+        # per-symbol CURRENT/VOLUME rows and caused the entire bulk feed to
+        # fail. PSX publishes the actual market-wide quote table at
+        # /market-watch.
+        r=_http_session.get(PSX_BULK_MARKET_WATCH_URL, headers=HEADERS, timeout=25)
         r.raise_for_status()
-        idx, rows=_table_rows_by_header(r.text, ("SYMBOL","CURRENT","CHANGE (%)","VOLUME"))
+        idx, rows=_table_rows_by_header(
+            r.text,
+            ("SYMBOL","LDCP","OPEN","HIGH","LOW","CURRENT","CHANGE (%)","VOLUME")
+        )
         for vals in rows:
             sym=vals[idx["SYMBOL"]].strip().upper()
             if not sym or not re.match(r"^[A-Z0-9&.\-]{1,30}$", sym):
                 continue
             allshr_rows[sym]={
+                "ldcp": _number(vals[idx["LDCP"]]),
+                "open": _number(vals[idx["OPEN"]]),
+                "high": _number(vals[idx["HIGH"]]),
+                "low": _number(vals[idx["LOW"]]),
                 "price": _number(vals[idx["CURRENT"]]),
                 "change": _number(vals[idx["CHANGE"]]) if "CHANGE" in idx else None,
                 "change_pct": _number(vals[idx["CHANGE (%)"]]),
                 "volume": _integer(vals[idx["VOLUME"]]),
-                "ldcp": _number(vals[idx["LDCP"]]) if "LDCP" in idx else None,
-                "shares_outstanding": (_number(vals[idx["SHARES (M)"]]) * 1e6) if "SHARES (M)" in idx and _number(vals[idx["SHARES (M)"]]) is not None else None,
-                "market_cap": (_number(vals[idx["MARKET CAP (M)"]]) * 1e6) if "MARKET CAP (M)" in idx and _number(vals[idx["MARKET CAP (M)"]]) is not None else None,
             }
     except Exception as exc:
-        errors.append(f"allshr: {exc}")
+        errors.append(f"market-watch: {exc}")
 
     symbols=sorted(set(screener_rows)|set(allshr_rows))
     items=[]
@@ -2329,9 +2338,9 @@ def fetch_psx_bulk_snapshot():
         b=screener_rows.get(sym,{})
         meta=symbol_metadata(sym)
         q={**meta, **b, **a, "symbol":sym}
-        # ALLSHR is the preferred quote source. Screener fills missing fields.
+        # Market Watch is the preferred quote source. Screener fills missing fields.
         q["price"]=a.get("price") if a.get("price") is not None else b.get("price")
-        q["source"]="PSX public bulk tables (ALLSHR + Stock Screener)"
+        q["source"]="PSX public bulk tables (Market Watch + Stock Screener)"
         q["source_delay"]="PSX public data is delayed by up to 5 minutes unless otherwise indicated."
         q["fetched_at"]=now.isoformat(timespec="seconds")
         items.append(q)
@@ -2363,7 +2372,7 @@ def _load_bulk_snapshot():
 
 def refresh_bulk_quotes():
     """Refresh the complete PSX universe with two bulk public pages.
-    This replaces the old 555-request fan-out as the primary path."""
+    This replaces the old 555-request fan-out as the primary path. Market Watch is the stock-level quote table; ALLSHR is an index and must not be parsed as a stock table."""
     with _bulk_quote_lock:
         if _bulk_quote_cache["in_progress"]:
             return
@@ -2418,7 +2427,16 @@ def get_bulk_quotes(force=False):
                 stale=True
             except Exception:
                 pass
-    if force or stale:
+    # Cold start must not return an empty universe. The old implementation
+    # launched a background request and immediately returned [], which made
+    # every screener display "0/0" and every stock row display dashes during
+    # the first request after a Render wake-up. On a cold start we perform one
+    # bounded bulk fetch synchronously; subsequent refreshes stay async.
+    with _bulk_quote_lock:
+        cold = not bool(_bulk_quote_cache["items"]) and not _bulk_quote_cache["in_progress"]
+    if cold:
+        refresh_bulk_quotes()
+    elif force or stale:
         threading.Thread(target=refresh_bulk_quotes, daemon=True).start()
     with _bulk_quote_lock:
         return {"items":list(_bulk_quote_cache["items"]),"updated_at":_bulk_quote_cache["time"].isoformat(timespec="seconds") if _bulk_quote_cache["time"] else None}
