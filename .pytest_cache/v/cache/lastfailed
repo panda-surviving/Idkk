@@ -1,5 +1,4 @@
 {
   "tests/test_v4_regressions.py": true,
-  "tests/test_v6_regressions.py": true,
-  "tests/test_v7_static.py::test_intraday_chart_timeframes_are_wired": true
+  "tests/test_v6_regressions.py": true
 }

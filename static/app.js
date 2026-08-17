@@ -2990,9 +2990,9 @@ async function loadMutualFunds() {
 }
 
 function renderMutualFunds(d) {
-  const isLive = d.source && d.source.startsWith("MUFAP live");
+  const isLive = d.source && d.source.toLowerCase().includes("live nav");
   $("mutualFundsSource").innerHTML =
-    `${isLive ? "🟢 Live NAV from MUFAP" : "🟡 MUFAP directory"} · ${esc(d.source)}`;
+    `${isLive ? "🟢 Live NAV from MUFAP" : "🟡 MUFAP cached/directory"} · ${esc(d.source)}`;
 
   const query = ($("fundSearch")?.value || "").trim().toUpperCase();
   const category = $("fundCategoryFilter")?.value || "";
@@ -3381,7 +3381,7 @@ async function loadDashboardTickers() {
       .map(f => ({ symbol: f.name.slice(0, 22), price: Number(f.nav).toFixed(2), pct: Number(f.ytd || 0) }));
 
     const psxLabel = stocks.market_state === "CLOSED" ? "PSX • CLOSED • LAST SESSION" : (stocks.market_state === "LIVE" ? "PSX LIVE" : "PSX LIVE • FEED UNAVAILABLE");
-    const psxStrip = psxItems.length ? buildTickerStrip(psxLabel, psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">${esc(psxLabel)}</span><span class="ticker-item">${esc(stocks.market_message || "Waiting for a real PSX quote feed…")}</span></div>`;
+    const psxStrip = psxItems.length ? buildTickerStrip(psxLabel, psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">${esc(psxLabel)}</span><span class="ticker-item">${esc(stocks.market_message || "PSX bulk quote snapshot is temporarily unavailable — retrying…")}</span></div>`;
     $("globalTickerBar").innerHTML = [
       psxStrip,
       cryptoItems.length ? buildTickerStrip("CRYPTO LIVE", cryptoItems) : "",
@@ -3618,6 +3618,11 @@ async function runScreener(presetCriteria = null) {
     if (!response.ok) throw new Error(`Request failed: ${response.status}`);
     const d = await response.json();
 
+    if (!Number(d.scanned || 0)) {
+      $("screenerResultCount").textContent = "PSX data feed has not returned a complete universe yet — no scan was run.";
+      $("screenerResults").innerHTML = `<div class="error-panel">No PSX symbols were available to scan. The app will retry the bulk PSX snapshot automatically. Your previous saved result is preserved.</div>`;
+      return;
+    }
     $("screenerResultCount").textContent = `${d.count} match${d.count === 1 ? "" : "es"} of ${d.scanned} scanned${d.last_scan_at ? ` • Last scan ${new Date(d.last_scan_at).toLocaleString()}` : ""}${d.stale ? " • saved result" : ""}`;
 
     $("screenerResults").innerHTML = d.results.length

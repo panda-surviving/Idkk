@@ -183,7 +183,10 @@ _mufap_cache = {"items": [], "time": None, "source": None}
 _mufap_lock = threading.Lock()
 _mufap_refresh_lock = threading.Lock()
 MUFAP_CACHE_MINUTES = 30
-MUFAP_NAV_URL = "https://www.mufap.com.pk/nav-all.php"
+MUFAP_NAV_URL = "https://www.mufap.com.pk/Industry/IndustryStatDaily?tab=3"
+PSX_BULK_SCREENER_URL = "https://dps.psx.com.pk/screener"
+PSX_BULK_ALLSHR_URL = "https://dps.psx.com.pk/indices/ALLSHR"
+PSX_BULK_SNAPSHOT_CACHE_MINUTES = 5
 
 # Crypto: CoinGecko's public markets endpoint needs no API key for
 # reasonable personal-use call volumes. Cached briefly since crypto
@@ -1885,6 +1888,16 @@ def fetch_yahoo_psx_quote(symbol):
 
 def get_quote(symbol, force=False):
     symbol = symbol.upper()
+    # Fast path: the bulk PSX snapshot is authoritative for quote fields and
+    # avoids a per-symbol HTTP request on every company-page load.
+    if not force:
+        try:
+            with _bulk_quote_lock:
+                hit = next((q for q in _bulk_quote_cache["items"] if q.get("symbol") == symbol), None)
+            if hit and hit.get("price") is not None:
+                return dict(hit)
+        except Exception:
+            pass
     now = datetime.now()
 
     with _quote_lock:
@@ -2216,84 +2229,199 @@ def _fetch_one_for_bulk(symbol):
         return {"symbol": symbol, "price": None, "source": "Unavailable", "error": str(exc)}
 
 
-def refresh_bulk_quotes():
-    """Fetch a live-ish price for every symbol in the PSX directory,
-    with limited concurrency, and store the result in _bulk_quote_cache.
-    Safe to call from a background thread or an on-demand route. Falls
-    back to the known FALLBACK_QUOTES symbols if the live directory
-    itself can't be reached, so the page still has something to show.
-    Also persists today's close/high/low/volume per symbol so technical
-    indicators accumulate real history over time (record_daily_prices)."""
-    import concurrent.futures
 
+def _parse_amount_token(value):
+    """Parse PSX compact amounts such as 203.6B, 7.0M and 499.1K."""
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text or text in {"—", "-", "0.0"}:
+        return 0.0 if text == "0.0" else None
+    mult = 1.0
+    suffix = text[-1:].upper()
+    if suffix == "K": mult, text = 1e3, text[:-1]
+    elif suffix == "M": mult, text = 1e6, text[:-1]
+    elif suffix == "B": mult, text = 1e9, text[:-1]
+    elif suffix == "T": mult, text = 1e12, text[:-1]
+    try:
+        return float(text) * mult
+    except Exception:
+        return None
+
+
+def _table_rows_by_header(html, required_headers=()):
+    """Return (header_map, rows) for the first HTML table containing the
+    requested header names. Header matching is whitespace/case tolerant."""
+    soup = BeautifulSoup(html, "html.parser")
+    wanted = {str(h).strip().upper() for h in required_headers}
+    for table in soup.find_all("table"):
+        header = table.find("tr")
+        if not header:
+            continue
+        cells = header.find_all(["th", "td"])
+        headers = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)).upper() for c in cells]
+        if not wanted.issubset(set(headers)):
+            continue
+        idx = {h:i for i,h in enumerate(headers)}
+        rows=[]
+        for tr in table.find_all("tr")[1:]:
+            vals=[c.get_text(" ", strip=True) for c in tr.find_all(["td","th"])]
+            if len(vals) < len(headers):
+                continue
+            rows.append(vals)
+        return idx, rows
+    raise RuntimeError(f"Could not find PSX table with headers: {sorted(wanted)}")
+
+
+def fetch_psx_bulk_snapshot():
+    """Fetch the PSX public bulk tables once instead of making 555+ quote
+    requests. The screener supplies fundamentals; ALLSHR supplies current
+    price/change/volume. This is dramatically faster and avoids the failure
+    mode where every per-symbol request times out and the UI becomes 0/0."""
+    now = datetime.now(ZoneInfo("Asia/Karachi"))
+    errors=[]
+    screener_rows={}
+    try:
+        r=_http_session.get(PSX_BULK_SCREENER_URL, headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        idx, rows=_table_rows_by_header(r.text, ("SYMBOL","PRICE","PE RATIO (TTM)","30D VOLUME AVG."))
+        for vals in rows:
+            sym=vals[idx["SYMBOL"]].strip().upper()
+            if not sym or not re.match(r"^[A-Z0-9&.\-]{1,30}$", sym):
+                continue
+            screener_rows[sym]={
+                "pe_ratio": _number(vals[idx["PE RATIO (TTM)"]]),
+                "price": _number(vals[idx["PRICE"]]),
+                "one_year_change": _number(vals[idx["1-YEAR CHANGE (%) *"]]) if "1-YEAR CHANGE (%) *" in idx else None,
+                "dividend_yield_pct": _number(vals[idx["DIVIDEND YIELD (%)"]]) if "DIVIDEND YIELD (%)" in idx else None,
+                "free_float": _parse_amount_token(vals[idx["FREE FLOAT"]]) if "FREE FLOAT" in idx else None,
+                "volume_30d_avg": _number(vals[idx["30D VOLUME AVG."]]),
+                "market_cap": _parse_amount_token(vals[idx["MARKET CAP."]]) if "MARKET CAP." in idx else None,
+            }
+    except Exception as exc:
+        errors.append(f"screener: {exc}")
+
+    allshr_rows={}
+    try:
+        r=_http_session.get(PSX_BULK_ALLSHR_URL, headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        idx, rows=_table_rows_by_header(r.text, ("SYMBOL","CURRENT","CHANGE (%)","VOLUME"))
+        for vals in rows:
+            sym=vals[idx["SYMBOL"]].strip().upper()
+            if not sym or not re.match(r"^[A-Z0-9&.\-]{1,30}$", sym):
+                continue
+            allshr_rows[sym]={
+                "price": _number(vals[idx["CURRENT"]]),
+                "change": _number(vals[idx["CHANGE"]]) if "CHANGE" in idx else None,
+                "change_pct": _number(vals[idx["CHANGE (%)"]]),
+                "volume": _integer(vals[idx["VOLUME"]]),
+                "ldcp": _number(vals[idx["LDCP"]]) if "LDCP" in idx else None,
+                "shares_outstanding": (_number(vals[idx["SHARES (M)"]]) * 1e6) if "SHARES (M)" in idx and _number(vals[idx["SHARES (M)"]]) is not None else None,
+                "market_cap": (_number(vals[idx["MARKET CAP (M)"]]) * 1e6) if "MARKET CAP (M)" in idx and _number(vals[idx["MARKET CAP (M)"]]) is not None else None,
+            }
+    except Exception as exc:
+        errors.append(f"allshr: {exc}")
+
+    symbols=sorted(set(screener_rows)|set(allshr_rows))
+    items=[]
+    for sym in symbols:
+        a=allshr_rows.get(sym,{})
+        b=screener_rows.get(sym,{})
+        meta=symbol_metadata(sym)
+        q={**meta, **b, **a, "symbol":sym}
+        # ALLSHR is the preferred quote source. Screener fills missing fields.
+        q["price"]=a.get("price") if a.get("price") is not None else b.get("price")
+        q["source"]="PSX public bulk tables (ALLSHR + Stock Screener)"
+        q["source_delay"]="PSX public data is delayed by up to 5 minutes unless otherwise indicated."
+        q["fetched_at"]=now.isoformat(timespec="seconds")
+        items.append(q)
+
+    if len(items) < 100:
+        raise RuntimeError("PSX bulk tables returned too few symbols" + ("; " + " | ".join(errors) if errors else ""))
+    return items, now.isoformat(timespec="seconds"), errors
+
+
+def _persist_bulk_snapshot(items, updated_at):
+    try:
+        conn=db()
+        data={"items":_clean_for_json(items),"updated_at":updated_at}
+        conn.execute("INSERT INTO screener_runs(cache_key,criteria_json,result_json,saved_at) VALUES(?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json,saved_at=excluded.saved_at", ("__bulk_quotes__","{}",json.dumps(data,separators=(",",":")),updated_at))
+        conn.commit(); conn.close()
+    except Exception:
+        pass
+
+
+def _load_bulk_snapshot():
+    try:
+        conn=db(); row=conn.execute("SELECT result_json,saved_at FROM screener_runs WHERE cache_key=?",("__bulk_quotes__",)).fetchone(); conn.close()
+        if not row: return None
+        data=json.loads(row["result_json"])
+        if not data.get("items"): return None
+        return data
+    except Exception:
+        return None
+
+def refresh_bulk_quotes():
+    """Refresh the complete PSX universe with two bulk public pages.
+    This replaces the old 555-request fan-out as the primary path."""
     with _bulk_quote_lock:
         if _bulk_quote_cache["in_progress"]:
             return
         _bulk_quote_cache["in_progress"] = True
-
     try:
         try:
-            symbols = [row["symbol"] for row in fetch_psx_symbols()]
-        except Exception:
+            items, updated_at, errors = fetch_psx_bulk_snapshot()
             with _bulk_quote_lock:
-                symbols = [q.get("symbol") for q in _bulk_quote_cache["items"] if q.get("symbol")]
-            if not symbols:
-                symbols = []
-
-        results = []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=BULK_FETCH_WORKERS) as pool:
-            for quote in pool.map(_fetch_one_for_bulk, symbols):
-                results.append(quote)
-
-        real_results = [q for q in results if q.get("price") is not None]
-        with _bulk_quote_lock:
-            # A transient provider outage must never overwrite a good last
-            # session snapshot with 555 empty rows.
-            if real_results:
-                _bulk_quote_cache["items"] = results
-                _bulk_quote_cache["time"] = datetime.now()
-            elif not _bulk_quote_cache["items"]:
-                _bulk_quote_cache["items"] = results
-                _bulk_quote_cache["time"] = datetime.now()
-
-        try:
-            if real_results:
-                record_daily_prices(real_results)
-            refresh_technicals_cache([q.get("symbol") for q in results if q.get("symbol")])
-        except Exception:
-            pass  # never let history recording break the live-quotes flow
+                _bulk_quote_cache["items"] = items
+                _bulk_quote_cache["time"] = datetime.fromisoformat(updated_at)
+            _persist_bulk_snapshot(items, updated_at)
+            real=[q for q in items if q.get("price") is not None]
+            if real:
+                record_daily_prices(real)
+                refresh_technicals_cache([q["symbol"] for q in real])
+        except Exception as bulk_exc:
+            # Secondary fallback: only if the bulk pages are unavailable, use
+            # the existing provider chain. Never overwrite a good snapshot
+            # with an empty/failed response.
+            with _bulk_quote_lock:
+                have_good=bool(_bulk_quote_cache["items"])
+            if not have_good:
+                try:
+                    persisted=_load_bulk_snapshot()
+                    if persisted:
+                        with _bulk_quote_lock:
+                            _bulk_quote_cache["items"]=persisted["items"]
+                            _bulk_quote_cache["time"]=datetime.fromisoformat(persisted["updated_at"])
+                except Exception:
+                    pass
+            if not _bulk_quote_cache["items"]:
+                # Do not fan out 555 requests immediately; a background retry
+                # will try the two bulk pages again.
+                pass
     finally:
         with _bulk_quote_lock:
             _bulk_quote_cache["in_progress"] = False
 
 
-
 def get_bulk_quotes(force=False):
     with _bulk_quote_lock:
-        stale = (
-            _bulk_quote_cache["time"] is None
-            or datetime.now() - _bulk_quote_cache["time"] > timedelta(minutes=BULK_REFRESH_MINUTES)
-        )
-        has_items = bool(_bulk_quote_cache["items"])
-
-    if force:
-        refresh_bulk_quotes()
-    elif stale and not has_items:
-        # Never expose the ten-symbol development snapshot as live PSX data.
-        # Start the real full-universe refresh in the background and return an
-        # empty live snapshot until genuine PSX quotes arrive.
+        has_items=bool(_bulk_quote_cache["items"])
+        stale=(_bulk_quote_cache["time"] is None or datetime.now()-_bulk_quote_cache["time"] > timedelta(minutes=BULK_REFRESH_MINUTES))
+    if not has_items:
+        persisted=_load_bulk_snapshot()
+        if persisted:
+            try:
+                with _bulk_quote_lock:
+                    _bulk_quote_cache["items"]=persisted["items"]
+                    _bulk_quote_cache["time"]=datetime.fromisoformat(persisted["updated_at"])
+                has_items=True
+                stale=True
+            except Exception:
+                pass
+    if force or stale:
         threading.Thread(target=refresh_bulk_quotes, daemon=True).start()
-    elif stale:
-        # Cache is stale but we already have something to show — refresh
-        # in the background and serve the slightly-old data immediately.
-        threading.Thread(target=refresh_bulk_quotes, daemon=True).start()
-
     with _bulk_quote_lock:
-        return {
-            "items": list(_bulk_quote_cache["items"]),
-            "updated_at": _bulk_quote_cache["time"].isoformat(timespec="seconds") if _bulk_quote_cache["time"] else None,
-        }
+        return {"items":list(_bulk_quote_cache["items"]),"updated_at":_bulk_quote_cache["time"].isoformat(timespec="seconds") if _bulk_quote_cache["time"] else None}
 
 
 def start_bulk_refresh_thread():
@@ -2353,77 +2481,53 @@ def get_fundamentals(symbol):
 # ---------------------------------------------------------
 
 def fetch_mufap_funds(force=False):
-    """Best-effort live scrape of MUFAP's public NAV listing, enriched
-    with AMC/category/AUM from the person's uploaded MUFAP "Asset
-    Allocation" export (MUFAP_FUND_DIRECTORY) where names match. If the
-    live scrape fails entirely, falls back to serving the full uploaded
-    directory directly (392 real funds, AUM-based, no live NAV) rather
-    than a tiny placeholder list — the page always says which source
-    it's showing via the returned label."""
-    now = datetime.now()
-
+    """Fetch the current MUFAP NAV/Daily Prices table. The old nav-all.php
+    parser used the wrong column positions; the current MUFAP table is
+    Fund, Category, Inception, Offer, Repurchase, NAV, Validity Date, ..."""
+    now=datetime.now()
     with _mufap_lock:
-        cached = _mufap_cache
-        if (
-            not force
-            and cached["time"]
-            and now - cached["time"] < timedelta(minutes=MUFAP_CACHE_MINUTES)
-        ):
+        cached=_mufap_cache
+        if not force and cached["time"] and now-cached["time"] < timedelta(minutes=MUFAP_CACHE_MINUTES):
             return cached["items"], cached["source"]
-
-    directory_by_name = {f["name"].strip().lower(): f for f in MUFAP_FUND_DIRECTORY}
-
+    directory_by_name={f["name"].strip().lower():f for f in MUFAP_FUND_DIRECTORY}
     try:
-        response = _http_session.get(MUFAP_NAV_URL, headers=HEADERS, timeout=20)
+        response=_http_session.get(MUFAP_NAV_URL, headers=HEADERS, timeout=25)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        funds = []
-        for row in soup.select("table tr"):
-            cells = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
-            if len(cells) < 3:
-                continue
-
-            name = cells[0]
-            nav = _number(cells[1]) if len(cells) > 1 else None
-
-            if not name or nav is None or name.lower() in ("fund name", "fund"):
-                continue
-
-            match = directory_by_name.get(name.strip().lower())
-
+        idx, rows=_table_rows_by_header(response.text,("FUND","CATEGORY","INCEPTION DATE","NAV","VALIDITY DATE"))
+        funds=[]
+        for vals in rows:
+            name=vals[idx["FUND"]].strip()
+            if not name or name.upper()=="FUND": continue
+            match=directory_by_name.get(name.lower(),{})
+            nav=_number(vals[idx["NAV"]])
+            if nav is None: continue
             funds.append({
-                "name": name,
-                "amc": match["amc"] if match else None,
-                "category": cells[2] if len(cells) > 2 else (match["category"] if match else "—"),
-                "inception": match["inception"] if match else None,
-                "nav": nav,
-                "ytd": _number(cells[3]) if len(cells) > 3 else None,
-                "aum_mn": match["aum_mn"] if match else None,
+                "name":name,
+                "amc":match.get("amc"),
+                "category":vals[idx["CATEGORY"]].strip() or match.get("category"),
+                "inception":vals[idx["INCEPTION DATE"]].strip() or match.get("inception"),
+                "offer":_number(vals[idx["OFFER"]]) if "OFFER" in idx else None,
+                "repurchase":_number(vals[idx["REPURCHASE"]]) if "REPURCHASE" in idx else None,
+                "nav":nav,
+                "validity_date":vals[idx["VALIDITY DATE"]].strip() if "VALIDITY DATE" in idx else None,
+                "front_end_load":_number(vals[idx["FRONT-END"]]) if "FRONT-END" in idx else None,
+                "back_end_load":_number(vals[idx["BACK-END"]]) if "BACK-END" in idx else None,
+                "aum_mn":match.get("aum_mn"),
             })
-
-        if not funds:
-            raise ValueError("No fund rows parsed from MUFAP page")
-
+        if not funds: raise ValueError("No current MUFAP NAV rows parsed")
+        try: record_fund_nav_history(funds)
+        except Exception: pass
+        trends=get_fund_trends([f["name"] for f in funds])
+        funds=[{**f,"trend":trends.get(f["name"],[])} for f in funds]
         with _mufap_lock:
-            _mufap_cache["items"] = funds
-            _mufap_cache["time"] = now
-            _mufap_cache["source"] = "MUFAP live"
-
-        try:
-            record_fund_nav_history(funds)
-        except Exception:
-            pass  # never let history recording break the live-NAV flow
-
-        return funds, "MUFAP live"
-
-    except (requests.RequestException, ValueError) as exc:
+            _mufap_cache.update({"items":funds,"time":now,"source":"MUFAP live NAV / Daily Prices Announcement"})
+        return funds,"MUFAP live NAV / Daily Prices Announcement"
+    except Exception as exc:
         with _mufap_lock:
-            _mufap_cache["items"] = MUFAP_FUND_DIRECTORY
-            _mufap_cache["time"] = now
-            _mufap_cache["source"] = "MUFAP directory (uploaded export, AUM-based)"
-
-        return MUFAP_FUND_DIRECTORY, f"MUFAP directory (uploaded export, AUM-based) — live NAV scrape failed: {exc}"
+            old=list(_mufap_cache["items"])
+        if old:
+            return old, f"MUFAP cached last successful NAV — refresh failed: {exc}"
+        return MUFAP_FUND_DIRECTORY, f"MUFAP directory only — live NAV unavailable: {exc}"
 
 
 def record_fund_nav_history(funds):
@@ -3200,8 +3304,8 @@ def stock_detail(symbol):
 
 @app.get("/api/market")
 def market():
-    symbols = list(FALLBACK_QUOTES.keys())
-    stocks = [get_quote(symbol) for symbol in symbols]
+    bulk = get_bulk_quotes()
+    stocks = bulk["items"][:100]
 
     return jsonify({
         "kse100": KSE100,
@@ -3357,7 +3461,7 @@ def stocks_live():
         valid_items = [q for q in bulk["items"] if q.get("price") is not None]
         if valid_items and in_session:
             market_state = "LIVE"
-            market_message = "PSX live/most-recent session data"
+            market_message = "PSX live/most-recent session data (public feed may be delayed up to 5 minutes)"
         elif valid_items:
             market_state = "CLOSED"
             market_message = "PSX market is closed; showing the last successful session."
@@ -5186,6 +5290,15 @@ def fetch_psx_scraper_universe():
 
 
 def get_symbols_for_full_scan():
+    # Reuse the same complete universe that powers the live table. This avoids
+    # a second full-directory request and guarantees the scanner sees the same
+    # 555+ symbols the user sees in All PSX Stocks.
+    try:
+        bulk = get_bulk_quotes()
+        if len(bulk.get("items", [])) >= 100:
+            return [{"symbol": q["symbol"], "company": q.get("company", q["symbol"]), "sector": q.get("sector", "")} for q in bulk["items"]]
+    except Exception:
+        pass
     try:
         items=fetch_psx_symbols(force=True)
         if len(items)>=100: return items
@@ -5225,6 +5338,7 @@ def run_psx_divergence_scan(progress_cb=None):
     # Warm as much of the full universe as possible in a handful of batched
     # requests before falling back to per-symbol providers. This is the main
     # performance fix for the 555+ symbol market-wide scan.
+    total = len(tickers)
     prefetch_started = time.time()
     if progress_cb:
         progress_cb(0, total, "Preparing batched PSX history…")

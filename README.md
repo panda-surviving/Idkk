@@ -209,3 +209,7 @@ now included as its own tab (Divergence Screener), separate from PSX
 ## Verification
 
 See `VERIFICATION.md` for the fixes, regression checks, and the exact live Render/PSX checks still required after deployment. The included `tests/test_math.py` and `tests/test_frontend_static.py` cover the calculation and UI-wiring regressions.
+
+## V8 deployment note
+
+V8 uses PSX public bulk tables for the primary all-market snapshot, persists the last successful snapshot in SQLite, and uses the current MUFAP NAV/Daily Prices Announcement table. For Render persistence, mount a persistent disk at `/data` and set `PSX_PERSISTENT_DATA_DIR=/data`.

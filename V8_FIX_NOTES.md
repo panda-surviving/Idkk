@@ -1,21 +1,68 @@
-# Yalvon360 PSX Divergence Screener — v8 reliability/performance fix
+# Yalvon360 / PSX Hub — V8 Fix Notes
 
-## Production problem fixed
-The browser was receiving an HTML `502` from `/api/psxdivergence/scan/status/<job_id>` while the full PSX scan was running. The expensive scan was running inside the same Gunicorn web worker, so heavy Yahoo/PSX I/O plus pandas calculations could starve or kill the web worker. The browser then tried to parse the proxy's HTML 502 as JSON.
+## Major production fixes
 
-## v8 changes
-- Moved the PSX divergence scan into a separate Python worker process (`psx_divergence_worker.py`).
-- The Gunicorn web process now stays responsive to start/status/cached requests while the scan runs.
-- Scan progress and the latest full result are file-backed in `.psx_divergence_jobs/`, so a Gunicorn restart no longer automatically loses the job status/result.
-- Status endpoint is deliberately tiny and reads the job state directly from disk.
-- Stale/dead worker PIDs are detected and converted to a clear scan error instead of leaving the UI spinning forever.
-- Duplicate Run Scan clicks/reloads reuse the active full-market job instead of launching another 555-symbol scan.
-- Yahoo batch history prefetch is tuned to 75 symbols/request and 2 concurrent batch requests; per-symbol analysis uses 4 workers. This reduces connection bursts and CPU/memory contention on Render free tier while keeping the scan parallel.
-- Frontend status polling retries transient HTML 502/network failures instead of immediately discarding a valid long-running scan.
-- Gunicorn request threads reduced from 8 to 4 because the expensive scan is no longer sharing the web worker.
+### 1. PSX live/all-stocks data no longer depends on 555+ individual quote requests
+The primary quote snapshot now uses two PSX public bulk tables:
+- `/screener` for P/E, dividend yield, 1-year change, 30-day average volume, market cap and price.
+- `/indices/ALLSHR` for current/most-recent price, change, LDCP, volume, shares and market cap.
 
-## Data/logic preserved
-The scan still requires the complete PSX universe guard, 52-week-low <=3% condition, independent 1D/1W/1M RSI divergence checks, bullish <=50 / strong <=30 and bearish >=70 / strong >=90 zones, Heikin-Ashi confirmation, and trend-structure confirmation.
+The two snapshots are merged by symbol. This reduces a full-market refresh to a handful of requests instead of hundreds of per-stock requests.
 
-## Important runtime behavior
-The first scan on a cold Render instance can still take time because real market history must be downloaded. Subsequent scans are substantially faster because the in-process history cache is reused while the persistent latest result is available immediately. The worker is intentionally separated from the web process so scan duration no longer causes the status API itself to time out.
+### 2. Last successful PSX snapshot survives Render restarts
+The complete quote snapshot is persisted in the existing SQLite `screener_runs` table under `__bulk_quotes__`. If a Render instance wakes up with no in-memory cache, the last successful snapshot is loaded immediately and a fresh bulk refresh runs in the background.
+
+### 3. PSX ticker status
+The ticker now distinguishes:
+- LIVE (public feed may be delayed up to 5 minutes)
+- CLOSED — showing the last successful session
+- FEED_UNAVAILABLE — only when there is genuinely no cached/bulk data
+
+No fake prices are generated.
+
+### 4. Mutual Funds / MUFAP
+The previous parser used the old `nav-all.php` column positions and therefore read the wrong fields. V8 uses MUFAP's current **NAV / Daily Prices Announcement** table and maps columns by header name.
+
+It now captures:
+- Fund
+- Category
+- Inception date
+- Offer price
+- Repurchase price
+- NAV
+- NAV validity date
+- Front/back load where published
+- AUM/AMC metadata from the bundled directory
+
+No NAV is invented when MUFAP is unreachable.
+
+### 5. Screener 0/0 failure
+If the PSX universe is empty, the screener no longer pretends a zero-stock scan completed. It explicitly reports that no scan was run and preserves the previous saved result.
+
+### 6. Divergence scanner crash fixed
+The market-wide divergence scanner referenced `total` before assigning it during its prefetch progress callback. V8 assigns the universe count before progress reporting, removing that crash.
+
+The divergence scanner also reuses the complete live PSX universe first, avoiding a duplicate symbol-directory request.
+
+### 7. Company quote fast path
+Company pages first use the bulk PSX snapshot instead of issuing another individual quote request. The old provider chain remains as a secondary fallback.
+
+## Real-data policy
+
+V8 does not fabricate hourly candles or fundamental values. If a genuine provider does not publish a requested interval/field, the UI must say so rather than create a value.
+
+PSX's public Data Portal currently labels its market data as delayed by 5 minutes unless otherwise indicated. Commercial/public redistribution of PSX market data requires the appropriate PSX rights/license.
+
+## Render
+
+Recommended start command:
+
+`gunicorn app:app --workers 1 --threads 8 --timeout 120 --keep-alive 5`
+
+Build/install:
+
+`pip install -r requirements.txt`
+
+For persistent scanner/snapshot history on Render, use a persistent disk and set:
+
+`PSX_PERSISTENT_DATA_DIR=/data`
