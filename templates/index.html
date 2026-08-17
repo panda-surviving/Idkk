@@ -53,7 +53,6 @@
         <button class="nav" data-page="macro">Macro</button>
         <button class="nav" data-page="news">News</button>
         <button class="nav" data-page="announcements">Announcements</button>
-        <button class="nav" data-page="insider">Insider Transactions</button>
         <button class="nav" data-page="journal">Journal</button>
         <button class="nav" data-page="tools">Tools</button>
         <button class="nav" data-page="worldclock">World Clock</button>
@@ -1150,26 +1149,6 @@
   </section>
 
 
-  <section id="insider" class="page">
-    <div class="page-intro">
-      <div>
-        <h2>PSX Insider Transactions</h2>
-        <p>Director, CEO, executive and substantial-shareholder interest disclosures published through official PSX company announcements.</p>
-      </div>
-      <a class="primary" href="https://dps.psx.com.pk/announcements/companies" target="_blank" rel="noopener">Open Official PSX Disclosures</a>
-    </div>
-    <div class="card">
-      <div class="card-head">
-        <div>
-          <h3>Insider Transactions &amp; Interest Disclosures</h3>
-          <p id="insiderTransactionsNote" class="muted-note">Filing titles and official documents are shown exactly as published by PSX. Transaction quantities are not inferred from a headline.</p>
-        </div>
-      </div>
-      <div id="insiderTransactionsList"></div>
-    </div>
-  </section>
-
-
   <section id="journal" class="page">
     <div class="page-intro">
       <div>
@@ -1253,6 +1232,11 @@
         <p>Build filters one at a time from your full checklist, or use a one-click preset below. Filters marked "Live" use real PSX data; the rest are shown for completeness and light up once a data vendor is connected.</p>
       </div>
       <button id="runScreenerBtn" class="primary">Run Screener</button>
+      <div class="card" style="margin-top:12px;">
+        <div class="card-head"><div><h3>Check One Stock</h3><p>Enter a PSX symbol to see which of your selected technical screener conditions it follows.</p></div></div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;"><input id="manualScreenerSymbol" class="search" style="max-width:220px;" placeholder="e.g. ABL"/><button id="manualScreenerCheckBtn" class="secondary">Check Stock</button></div>
+        <div id="manualScreenerResult" style="margin-top:10px;"></div>
+      </div>
     </div>
 
     <div class="card">
@@ -1268,20 +1252,6 @@
       <div id="activeFilterChips" class="active-filter-chips">
         <span class="muted-note">No filters yet — add some below, then press Run Screener.</span>
       </div>
-    </div>
-
-    <div class="card">
-      <div class="card-head">
-        <div>
-          <h3>Check One Stock Against My Technical Screener</h3>
-          <p>Search any PSX symbol and see exactly which live technical rules it passes, fails, or lacks enough real history to evaluate. Personalized RSI-divergence rules are shown separately.</p>
-        </div>
-      </div>
-      <div class="stock-toolbar screener-stock-checker">
-        <input id="manualScreenerSymbol" class="search" type="text" placeholder="Enter PSX symbol, e.g. ABL, HBL, OGDC..." autocomplete="off">
-        <button id="manualScreenerCheckBtn" class="primary">Check Stock</button>
-      </div>
-      <div id="manualScreenerResults"><div class="empty-chart">Enter a PSX symbol to audit your screener points.</div></div>
     </div>
 
     <div class="card">
@@ -1612,11 +1582,13 @@
               <th>Price</th>
               <th>Change %</th>
               <th>Volume</th>
+              <th>1D Vol</th>
+              <th>1W Vol</th>
+              <th>1M Vol</th>
               <th>30D Avg Vol</th>
               <th>P/E</th>
               <th>EPS</th>
-              <th>Book Value / Share</th>
-              <th>P/B</th>
+              <th>Book Value / Sh.</th>
               <th>Div Yield</th>
               <th>RSI (14)</th>
               <th>Trend (50/200 SMA)</th>
@@ -1695,7 +1667,7 @@
         <div class="chart-timeframe-group" id="chartTimeframeGroup">
           <button class="chart-tf-btn" data-tf="1H">1H</button>
           <button class="chart-tf-btn" data-tf="5H">5H</button>
-          <button class="chart-tf-btn" data-tf="1D">1D</button>
+          <button class="chart-tf-btn active" data-tf="1D">1D</button>
           <button class="chart-tf-btn" data-tf="5D">5D</button>
           <button class="chart-tf-btn" data-tf="1M">1M</button>
           <button class="chart-tf-btn" data-tf="3M">3M</button>
@@ -2047,6 +2019,16 @@
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
 }
+</script>
+
+<script>
+document.getElementById("manualScreenerCheckBtn")?.addEventListener("click", async () => {
+  const symbol = document.getElementById("manualScreenerSymbol")?.value?.trim();
+  const out = document.getElementById("manualScreenerResult");
+  if (!symbol) { out.innerHTML = '<div class="error-panel">Enter a PSX symbol.</div>'; return; }
+  try { out.innerHTML = await window.checkSingleStockAgainstScreener(symbol, typeof collectScreenerCriteria === "function" ? collectScreenerCriteria() : {}); }
+  catch (e) { out.innerHTML = `<div class="error-panel">${String(e.message || e)}</div>`; }
+});
 </script>
 </body>
 </html>

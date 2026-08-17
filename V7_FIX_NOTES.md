@@ -1,34 +1,33 @@
-# Yalvon360 v7 fixes
+# Yalvon360 PSX Hub — V7 Fix Notes
 
-## Divergence Screener reliability
-- Fixed the full-scan progress initialization bug: the real universe count is now established before any progress callback runs.
-- Full scans still refuse the ten-symbol development fallback and use the complete PSX equity directory.
-- Batched Yahoo `.KA` history warm-up now uses a smaller 2-year payload, 40-symbol batches, three concurrent batches, no nested yfinance thread pool, and a 10-second batch timeout.
-- Direct PSX/scraper/Yahoo single-symbol providers remain the fallback for symbols missing from the batch feed.
-- Scan result accounting now distinguishes usable history, insufficient-history skips, and actual provider failures.
-- Personalized master matches are real conjunctions: bullish reversal = near 52-week low + bullish divergence on 1D/1W/1M + RSI <=50 (strong <=30) + downtrend structure + green Heikin-Ashi; bearish reversal = bearish divergence + RSI >=70 (strong >=90) + uptrend structure + red Heikin-Ashi.
-- Bearish divergence and structure now use actual swing highs rather than switching to closing-price pivots.
+## Major fixes
 
-## PSX live/latest market quotes
-- Added a fast official PSX screener-table parser for market-wide price/change snapshots, avoiding ~555 individual company-page requests just to populate the ticker/directory.
-- The global PSX LIVE ticker, All PSX Stocks and market breadth now share the complete market-wide quote snapshot.
-- The app retains the last good full snapshot during temporary feed outages and only falls back to per-company pages when no prior snapshot exists.
-- Quote source/status is exposed rather than silently presenting development values.
+- PSX live feed no longer replaces a good last-session snapshot with an all-blank response.
+- PSX quote chain is now: official company page -> official PSX timeseries price -> Yahoo Finance `.KA` secondary real-market quote. Development sample quotes are no longer exposed by `/api/stocks/live`.
+- Market banner distinguishes `LIVE`, `CLOSED • LAST SESSION`, and `FEED UNAVAILABLE`.
+- Interactive chart timeframe semantics were corrected:
+  - `1H` = genuine 60-minute candles only
+  - `5H` = 5-hour candles aggregated from genuine hourly OHLCV only
+  - `1D` = daily candles across 12 years where available
+  - `5D` = 5-day candles
+  - `1M` = monthly candles
+  - `3M` = quarterly candles
+  - `6M` = half-year candles
+  - `1Y` = annual candles across 25 years where available
+  - `3Y`, `5Y`, `ALL` = longer-period real history
+- The app explicitly refuses to manufacture hourly candles from daily candles.
+- Added EPS, book value/share, dividend yield/share, market cap and shares-outstanding extraction when the real source publishes them.
+- Added 1D/1W/1M/30D-average volume fields to the stock API and stock directory when real recorded daily volume exists.
+- Screener results now have a persistent SQLite cache and include `last_scan_at`. A persistent Render disk can be enabled with `PSX_PERSISTENT_DATA_DIR=/data` for restart survival.
+- Added `/api/screener/check-stock` and a manual “Check One Stock” UI to compare one PSX stock against selected technical screener conditions.
+- Divergence/technical cached results are also written to the same persistent cache.
 
-## Stock charts and indicators
-- Added intraday chart windows: 1D (5-minute), 5D (15-minute), and 1H (60-minute bars over the provider's supported retention window), when Yahoo exposes PSX `.KA` intraday data.
-- Intraday candles, volume, RSI, MACD and SMA/EMA overlays use the same real returned bars.
-- Daily/weekly/monthly historical chart behavior remains intact.
-- Fibonacci and classic pivot levels continue to be computed from the most recent completed daily session.
-- Existing OHLC sanitization remains in place to prevent malformed provider values from creating impossible candle wicks.
+## Important data-integrity rule
 
-## News & announcements
-- Market-wide announcements now merge official PSX Company Announcements, PSX Notices, Corporate Briefing Sessions, CDC, SECP, NCCPL and Payout streams in parallel.
-- Announcement rows are displayed directly in Yalvon360 even when PSX does not expose a document URL; document links are preserved when present.
-- Stock-specific pages continue to fetch only that company's PSX filing rows.
+No synthetic/fake market candles or fake fundamentals are inserted. If a genuine provider does not supply a requested interval/value, the UI reports it as unavailable rather than inventing a number.
 
-## Verification
-- `python -m py_compile app.py psx_screener.py` passes.
-- `node --check static/app.js` and `node --check static/sw.js` pass.
-- Existing pure/static regression tests pass: 6 tests.
-- A full live PSX/Yahoo/Render scan cannot be honestly executed from this sandbox because outbound package installation/network access is unavailable; runtime code is therefore written to fail explicitly or use provider fallbacks rather than fabricate results.
+## Render commands
+
+Build: `pip install -r requirements.txt`
+
+Start: `gunicorn app:app --workers 1 --threads 8 --timeout 120 --keep-alive 5`

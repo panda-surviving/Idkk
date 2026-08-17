@@ -1,10 +1,6 @@
 from flask import Flask, jsonify, render_template, request, Response
 from pathlib import Path
 from datetime import datetime, timedelta, date
-try:
-    from zoneinfo import ZoneInfo
-except Exception:  # pragma: no cover
-    ZoneInfo = None
 import sqlite3
 import requests
 import threading
@@ -17,8 +13,7 @@ import uuid
 import datetime as dt
 import math
 import os
-import sys
-import subprocess
+from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 
 # numpy/pandas power the intraday RSI-divergence technical scanners
@@ -85,7 +80,15 @@ def safe_jsonify(data):
     return jsonify(_clean_for_json(data))
 
 BASE = Path(__file__).resolve().parent
-DB = BASE / "portfolio.db"
+# Render restarts are ephemeral on the free filesystem.  If a persistent disk
+# is mounted, set PSX_PERSISTENT_DATA_DIR=/data so saved screeners/history live
+# across restarts; otherwise the app still persists within the current instance.
+PERSISTENT_DATA_DIR = Path(os.environ.get("PSX_PERSISTENT_DATA_DIR", str(BASE)))
+try:
+    PERSISTENT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    PERSISTENT_DATA_DIR = BASE
+DB = PERSISTENT_DATA_DIR / "portfolio.db"
 
 app = Flask(__name__)
 
@@ -101,19 +104,7 @@ PSX_ALT_COMPANY_URL = f"{PSX_ALT_BASE}/company/{{symbol}}"
 PSX_ALT_INTRADAY_URL = f"{PSX_ALT_BASE}/timeseries/int/{{symbol}}"
 PSX_ALT_ELIGIBLE_URL = f"{PSX_ALT_BASE}/eligible-scrips"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}.KA"
-
-# Optional licensed PSX intraday/fundamentals provider. Capital Stake is an
-# authorized PSX data vendor and exposes genuine 1m/5m/15m OHLCV, insider
-# transactions and audited fundamentals. The app only uses it when a token is
-# configured; it never fabricates hourly candles when no genuine feed exists.
-CAPITAL_STAKE_API_TOKEN = os.environ.get("CAPITAL_STAKE_API_TOKEN", "").strip()
-CAPITAL_STAKE_API_BASE = os.environ.get("CAPITAL_STAKE_API_BASE", "https://csapis.com/3.0").rstrip("/")
-CAPITAL_STAKE_CHART_ENDPOINT = os.environ.get("CAPITAL_STAKE_CHART_ENDPOINT", "/market/chart")
-TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY", "").strip()
-
 PSX_SCRAPER_API_BASE = os.environ.get("PSX_SCRAPER_API_BASE", "https://nifraa-psx-stock-intel.hf.space/api").rstrip("/")
-PSX_SCREENER_URL = "https://dps.psx.com.pk/screener/"
-PSX_ALT_SCREENER_URL = f"{PSX_ALT_BASE}/screener/"
 
 
 HEADERS = {
@@ -131,10 +122,6 @@ HEADERS = {
 
 SYMBOL_CACHE_MINUTES = 60
 QUOTE_CACHE_SECONDS = 120
-# A real PSX regular-equity directory is several hundred symbols. Requiring
-# a large minimum prevents a partial upstream response (or the old ten-symbol
-# development directory) from ever being mistaken for the full universe.
-MIN_COMPLETE_PSX_SYMBOLS = 400
 
 # Shared, connection-pooled, retry-hardened HTTP session used for every
 # outbound request this app makes to PSX and MUFAP. Reusing one session
@@ -1501,10 +1488,10 @@ def init_db():
         PRIMARY KEY(day, fund_name)
     );
 
-    CREATE TABLE IF NOT EXISTS screener_results (
-        cache_key TEXT PRIMARY KEY,
-        screener_name TEXT NOT NULL,
-        criteria_json TEXT,
+    CREATE TABLE IF NOT EXISTS screener_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cache_key TEXT NOT NULL UNIQUE,
+        criteria_json TEXT NOT NULL,
         result_json TEXT NOT NULL,
         saved_at TEXT NOT NULL
     );
@@ -1630,7 +1617,7 @@ def fetch_psx_symbols(force=False):
         r=_http_session.get(PSX_ALT_ELIGIBLE_URL, headers=HEADERS, timeout=20)
         r.raise_for_status()
         items=_parse_eligible_scrips_html(r.text)
-        if len(items) >= MIN_COMPLETE_PSX_SYMBOLS:
+        if len(items) >= 100:
             with _symbol_lock:
                 _symbol_cache.update({"items":items,"time":now})
             return items
@@ -1642,7 +1629,7 @@ def fetch_psx_symbols(force=False):
         r=_http_session.get("https://dps.psx.com.pk/eligible-scrips", headers=HEADERS, timeout=20)
         r.raise_for_status()
         items=_parse_eligible_scrips_html(r.text)
-        if len(items) >= MIN_COMPLETE_PSX_SYMBOLS:
+        if len(items) >= 100:
             with _symbol_lock:
                 _symbol_cache.update({"items":items,"time":now})
             return items
@@ -1650,7 +1637,7 @@ def fetch_psx_symbols(force=False):
         errors.append(f"primary eligible: {exc}")
 
     # JSON symbol directories are accepted only when they are demonstrably
-    # complete (400+ entries), otherwise they are treated as a partial feed.
+    # complete (100+ entries), otherwise they are treated as a partial feed.
     for url in (PSX_SYMBOLS_URL, PSX_ALT_SYMBOLS_URL):
         try:
             r=_http_session.get(url, headers=HEADERS, timeout=15)
@@ -1664,7 +1651,7 @@ def fetch_psx_symbols(force=False):
                     continue
                 seen.add(symbol)
                 items.append({"symbol":symbol,"company":str(row.get("name","")).strip(),"sector":str(row.get("sectorName","")).strip()})
-            if len(items) >= MIN_COMPLETE_PSX_SYMBOLS:
+            if len(items) >= 100:
                 items.sort(key=lambda x:x["symbol"])
                 with _symbol_lock:
                     _symbol_cache.update({"items":items,"time":now})
@@ -1801,115 +1788,16 @@ def parse_company_page(symbol, html):
         "bid_price": _number(_search(text, r'\bBid Price\s*([\d,.]+)')),
         "bid_volume": _integer(_search(text, r'\bBid Volume\s*([\d,]+)')),
         "pe_ratio": _number(_search(text, r'P/E Ratio\s*\(TTM\)\s*([\d,.]+)')),
+        "eps_ttm": _number(_search(text, r'(?:EPS|Earnings Per Share)(?:\s*\(TTM\))?\s*[:\-]?\s*([+\-]?[\d,.]+)')),
+        "book_value_per_share": _number(_search(text, r'(?:Book Value(?:\s*/\s*Share| Per Share)?|BVPS)\s*[:\-]?\s*([+\-]?[\d,.]+)')),
+        "dividend_yield_pct": _number(_search(text, r'Dividend Yield\s*[:\-]?\s*([+\-]?[\d,.]+)\s*%?')),
+        "dividend_per_share": _number(_search(text, r'(?:Dividend(?: Per Share)?|DPS)\s*[:\-]?\s*([+\-]?[\d,.]+)')),
+        "market_cap": _number(_search(text, r'(?:Market Cap|Market Capitalization)\s*[:\-]?\s*([\d,.]+)')),
+        "shares_outstanding": _number(_search(text, r'(?:Shares Outstanding|Outstanding Shares)\s*[:\-]?\s*([\d,.]+)')),
         "one_year_change": _number(_search(text, r'1-Year Change[^0-9+\-]*([+\-]?\d+(?:\.\d+)?)%')),
         "ytd_change": _number(_search(text, r'YTD Change[^0-9+\-]*([+\-]?\d+(?:\.\d+)?)%')),
         "last_update": _search(text, r'Last update:\s*([^*]+?)(?=\s+Open\b|\s+Company Profile\b|$)'),
-        "eps_annual": None,
-        "eps_quarterly": [],
-        "dividend_yield_pct": None,
-        "book_value_per_share": None,
-        "price_to_book": None,
-        "market_cap": None,
-        "shares_outstanding": None,
-        "free_float_shares": None,
-        "free_float_pct": None,
-        "face_value": None,
-        "dividend_per_share": None,
-        "dividend_payout_pct": None,
-        "debt_to_equity": None,
-        "current_ratio": None,
-        "return_on_equity_pct": None,
-        "return_on_assets_pct": None,
     }
-
-    # PSX company pages expose real financial tables. Extract the latest
-    # annual/quarterly EPS and any investment-ratio fields when present.
-    # These are source-backed values; we never manufacture missing fields.
-    def row_numbers(row):
-        cells = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["td", "th"])]
-        nums = []
-        for cell in cells[1:]:
-            m = re.search(r"([+\-]?\d+(?:,\d{3})*(?:\.\d+)?)", cell.replace(",", ""))
-            if m:
-                try:
-                    nums.append(float(m.group(1)))
-                except ValueError:
-                    pass
-        return cells, nums
-
-    for table in soup.find_all("table"):
-        for row in table.find_all("tr"):
-            cells, nums = row_numbers(row)
-            if not cells:
-                continue
-            label = cells[0].strip().lower()
-            if label in {"eps", "earnings per share", "earnings per share (eps)", "basic earnings per share (eps)"} and nums:
-                if quote["eps_annual"] is None:
-                    quote["eps_annual"] = nums[0]
-                elif not quote["eps_quarterly"]:
-                    quote["eps_quarterly"] = nums
-            elif "dividend yield" in label and nums and quote["dividend_yield_pct"] is None:
-                quote["dividend_yield_pct"] = nums[0]
-            elif ("break-up value" in label or "book value per share" in label or "breakup value" in label) and nums and quote["book_value_per_share"] is None:
-                quote["book_value_per_share"] = nums[0]
-            elif ("price to book" in label or "p/b" in label) and nums and quote["price_to_book"] is None:
-                quote["price_to_book"] = nums[0]
-            elif ("dividend per share" in label or "cash dividend per share" in label or label == "dividend") and nums and quote["dividend_per_share"] is None:
-                quote["dividend_per_share"] = nums[0]
-            elif ("dividend payout" in label or "payout ratio" in label) and nums and quote["dividend_payout_pct"] is None:
-                quote["dividend_payout_pct"] = nums[0]
-            elif ("debt to equity" in label or "debt/equity" in label or "d/e" in label) and nums and quote["debt_to_equity"] is None:
-                quote["debt_to_equity"] = nums[0]
-            elif "current ratio" in label and nums and quote["current_ratio"] is None:
-                quote["current_ratio"] = nums[0]
-            elif ("return on equity" in label or "roe" == label) and nums and quote["return_on_equity_pct"] is None:
-                quote["return_on_equity_pct"] = nums[0]
-            elif ("return on assets" in label or "roa" == label) and nums and quote["return_on_assets_pct"] is None:
-                quote["return_on_assets_pct"] = nums[0]
-
-    # Some PSX pages render ratios as plain label/value text instead of
-    # semantic table rows. These fallbacks only parse values that are actually
-    # printed by the source page; missing fields remain null.
-    def first_label_value(patterns):
-        for pat in patterns:
-            val = _number(_search(text, pat))
-            if val is not None:
-                return val
-        return None
-
-    if quote["book_value_per_share"] is None:
-        quote["book_value_per_share"] = first_label_value([
-            r'Break[\- ]?up Value(?:\s*/\s*Share)?\s*([\d,.]+)',
-            r'Book Value(?:\s*/\s*Share)?\s*([\d,.]+)',
-            r'Book Value Per Share\s*([\d,.]+)',
-        ])
-    if quote["price_to_book"] is None:
-        quote["price_to_book"] = first_label_value([r'Price\s*(?:/|to)\s*Book\s*([\d,.]+)', r'P\s*/\s*B\s*([\d,.]+)'])
-    if quote["dividend_yield_pct"] is None:
-        quote["dividend_yield_pct"] = first_label_value([r'Dividend Yield\s*([\d,.]+)\s*%?', r'Dividend Yield %\s*([\d,.]+)'])
-    if quote["dividend_per_share"] is None:
-        quote["dividend_per_share"] = first_label_value([r'Dividend Per Share\s*([\d,.]+)', r'Cash Dividend Per Share\s*([\d,.]+)'])
-    if quote["face_value"] is None:
-        quote["face_value"] = first_label_value([r'Face Value\s*([\d,.]+)'])
-    if quote["dividend_payout_pct"] is None:
-        quote["dividend_payout_pct"] = first_label_value([r'Dividend Payout(?: Ratio)?\s*([\d,.]+)\s*%?'])
-    if quote["debt_to_equity"] is None:
-        quote["debt_to_equity"] = first_label_value([r'Debt\s*(?:/|to)\s*Equity\s*([\d,.]+)'])
-    if quote["current_ratio"] is None:
-        quote["current_ratio"] = first_label_value([r'Current Ratio\s*([\d,.]+)'])
-    if quote["return_on_equity_pct"] is None:
-        quote["return_on_equity_pct"] = first_label_value([r'Return on Equity(?:\s*\(ROE\))?\s*([\d,.]+)\s*%?'])
-    if quote["return_on_assets_pct"] is None:
-        quote["return_on_assets_pct"] = first_label_value([r'Return on Assets(?:\s*\(ROA\))?\s*([\d,.]+)\s*%?'])
-
-    # Equity-profile values are usually rendered as label/value text rather
-    # than table rows.
-    quote["market_cap"] = _number(_search(text, r'Market Cap\s*\(000\'s\)\s*([\d,.]+)'))
-    quote["shares_outstanding"] = _integer(_search(text, r'\bShares\s*([\d,]+)'))
-    ff_match = re.search(r'Free Float\s*([\d,]+)\s*Free Float\s*([\d.]+)%', text, re.I)
-    if ff_match:
-        quote["free_float_shares"] = _integer(ff_match.group(1))
-        quote["free_float_pct"] = _number(ff_match.group(2))
 
     day_range = re.search(
         r'DAY RANGE\s*([\d,.]+)\s*[—-]\s*([\d,.]+)',
@@ -1950,6 +1838,51 @@ def parse_company_page(symbol, html):
     return quote
 
 
+def fetch_yahoo_psx_quote(symbol):
+    """Best-effort secondary quote source for PSX symbols.
+
+    Yahoo's .KA chart endpoint is used only as a secondary real-market source
+    when the PSX company page is unavailable or has changed markup.  No values
+    are fabricated: if Yahoo has no quote, this function returns None.
+    """
+    symbol = symbol.upper().strip()
+    response = _http_session.get(
+        YAHOO_CHART_URL.format(symbol=symbol),
+        params={"range": "1d", "interval": "5m", "events": "div,splits"},
+        headers={**HEADERS, "Accept": "application/json,text/plain,*/*"}, timeout=12,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    result = ((payload.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        return None
+    meta = result.get("meta") or {}
+    q = (((result.get("indicators") or {}).get("quote") or [None])[0]) or {}
+    ts = result.get("timestamp") or []
+    closes = q.get("close") or []
+    valid = [(i, float(v)) for i, v in enumerate(closes) if v is not None]
+    if not valid:
+        price = meta.get("regularMarketPrice")
+        return {"price": _number(price), "change_pct": None, "volume": None, "source": "Yahoo Finance (.KA)"} if price is not None else None
+    i, price = valid[-1]
+    prev = None
+    for j in range(i-1, -1, -1):
+        if closes[j] is not None:
+            prev = float(closes[j]); break
+    volume = None
+    vols = q.get("volume") or []
+    if i < len(vols) and vols[i] is not None:
+        volume = _integer(vols[i])
+    change_pct = ((price - prev) / prev * 100) if prev not in (None, 0) else None
+    return {
+        "price": price,
+        "change_pct": change_pct,
+        "volume": volume,
+        "source": "Yahoo Finance (.KA)",
+        "last_update": datetime.fromtimestamp(ts[i], tz=ZoneInfo("Asia/Karachi")).isoformat(timespec="seconds") if i < len(ts) else None,
+    }
+
+
 def get_quote(symbol, force=False):
     symbol = symbol.upper()
     now = datetime.now()
@@ -1970,24 +1903,29 @@ def get_quote(symbol, force=False):
             response.raise_for_status()
             quote = parse_company_page(symbol, response.text)
 
-            # Merge real market-wide fields whenever available. This fills
-            # screener-only metrics (30D volume, dividend yield, etc.) without
-            # replacing the richer company-page fields.
-            with _bulk_quote_lock:
-                bulk_match = next((q for q in _bulk_quote_cache["items"] if q.get("symbol") == symbol), None)
-            if bulk_match is not None:
-                for k in (
-                    "price", "change_pct", "volume", "pe_ratio", "dividend_yield",
-                    "volume_30d_avg", "one_year_change", "eps", "book_value_per_share", "price_to_book"
-                ):
-                    if quote.get(k) is None and bulk_match.get(k) is not None:
-                        quote[k] = bulk_match.get(k)
-                quote["source"] = quote.get("source") or bulk_match.get("source", "PSX official screener")
-            else:
-                quote["source"] = quote.get("source") or "PSX company page"
-
             if quote.get("price") is None:
-                raise RuntimeError("PSX company page returned no usable price")
+                # Official PSX timeseries fallback: it can still provide the
+                # latest real traded price when the company-page HTML changes.
+                try:
+                    points = get_intraday(symbol)
+                except Exception:
+                    points = []
+                if points:
+                    quote["price"] = points[-1].get("y")
+                    if len(points) >= 2 and points[-2].get("y") not in (None, 0):
+                        quote["change_pct"] = ((quote["price"] - points[-2]["y"]) / points[-2]["y"]) * 100
+                    quote["source"] = "PSX official timeseries"
+                else:
+                    try:
+                        yq = fetch_yahoo_psx_quote(symbol)
+                    except Exception:
+                        yq = None
+                    if yq and yq.get("price") is not None:
+                        quote.update({k: v for k, v in yq.items() if v is not None})
+                        quote["source"] = yq.get("source", "Yahoo Finance (.KA)")
+                    else:
+                        # Never present development numbers as live market data.
+                        quote["source"] = "PSX company page (quote unavailable)"
 
             quote["source"] = quote.get("source") or "PSX company page"
             quote["fetched_at"] = now.isoformat(timespec="seconds")
@@ -1998,13 +1936,29 @@ def get_quote(symbol, force=False):
         except Exception as exc:
             last_exc = exc
 
-    exc = last_exc or requests.RequestException("PSX company page unavailable")
+    # Secondary real-market provider before any development/static fallback.
+    try:
+        yq = fetch_yahoo_psx_quote(symbol)
+    except Exception as exc:
+        yq = None
+        yahoo_exc = exc
+    if yq and yq.get("price") is not None:
+        return {
+            **symbol_metadata(symbol),
+            **yq,
+            "symbol": symbol,
+            "fetched_at": now.isoformat(timespec="seconds"),
+        }
+
+    # Keep the old development values only for non-market pages/tests. They
+    # are deliberately NOT returned by the live bulk feed.
+    fallback = FALLBACK_QUOTES.get(symbol)
     return {
         **symbol_metadata(symbol),
         "price": None,
         "volume": None,
         "source": "Unavailable",
-        "error": str(exc),
+        "error": str(last_exc or "No real PSX quote source available"),
         "fetched_at": now.isoformat(timespec="seconds"),
     }
 
@@ -2255,84 +2209,6 @@ def get_cached_technicals(symbol):
 # Bulk "all PSX stocks, live" fetch
 # ---------------------------------------------------------
 
-def _parse_psx_screener_quotes(html):
-    """Parse the official PSX stock-screener table into a lightweight
-    market-wide quote snapshot.  The screener page exposes the complete
-    regular-equity directory and current/latest price/change in one request,
-    which is materially faster and more reliable than opening ~555 company
-    pages just to populate the global PSX ticker and stock directory."""
-    soup = BeautifulSoup(html, "html.parser")
-    table = soup.find("table")
-    if table is None:
-        return []
-    headers = [" ".join(c.get_text(" ", strip=True).split()).lower() for c in table.find_all("th")]
-    if not headers:
-        first = table.find("tr")
-        headers = [" ".join(c.get_text(" ", strip=True).split()).lower() for c in first.find_all(["td", "th"])] if first else []
-    def idx(*names):
-        for name in names:
-            for i, h in enumerate(headers):
-                if name in h:
-                    return i
-        return None
-    i_symbol = idx("symbol")
-    i_price = idx("price")
-    i_change = idx("change (%)", "change")
-    i_y1 = idx("1-year ch")
-    i_pe = idx("pe ratio")
-    i_eps = idx("eps")
-    i_bvps = idx("book value", "break-up value", "breakup value", "bvps")
-    i_pb = idx("price to book", "p/b", "pb ratio")
-    i_div = idx("dividend yield")
-    i_float = idx("free float")
-    i_vol = idx("30d volume")
-    if i_symbol is None or i_price is None:
-        return []
-    out, seen = [], set()
-    for tr in table.find_all("tr"):
-        cells = [" ".join(c.get_text(" ", strip=True).split()) for c in tr.find_all("td")]
-        if len(cells) <= max(i_symbol, i_price):
-            continue
-        symbol = cells[i_symbol].strip().upper()
-        if not re.fullmatch(r"[A-Z0-9&.\-]{1,30}", symbol) or symbol in seen:
-            continue
-        price = _number(cells[i_price])
-        if price is None:
-            continue
-        def pct_at(i):
-            if i is None or i >= len(cells): return None
-            m = re.search(r"([+\-]?\d+(?:\.\d+)?)%", cells[i].replace(",", ""))
-            return _number(m.group(1)) if m else _number(cells[i])
-        def num_at(i):
-            return _number(cells[i].replace(",", "")) if i is not None and i < len(cells) else None
-        seen.add(symbol)
-        out.append({
-            "symbol": symbol, "price": price, "change_pct": pct_at(i_change),
-            "one_year_change": pct_at(i_y1), "pe_ratio": num_at(i_pe),
-            "eps": num_at(i_eps),
-            "book_value_per_share": num_at(i_bvps),
-            "price_to_book": num_at(i_pb),
-            "dividend_yield": pct_at(i_div), "free_float": cells[i_float] if i_float is not None and i_float < len(cells) else None,
-            "volume_30d_avg": num_at(i_vol), "source": "PSX official screener (latest/delayed where applicable)",
-        })
-    return out
-
-
-def fetch_psx_bulk_quotes():
-    errors = []
-    for url in (PSX_SCREENER_URL, PSX_ALT_SCREENER_URL):
-        try:
-            r = _http_session.get(url, headers=HEADERS, timeout=15)
-            r.raise_for_status()
-            items = _parse_psx_screener_quotes(r.text)
-            if len(items) >= MIN_COMPLETE_PSX_SYMBOLS:
-                return items, url
-            errors.append(f"{url}: only {len(items)} quotes")
-        except Exception as exc:
-            errors.append(f"{url}: {exc}")
-    return [], "; ".join(errors[-2:])
-
-
 def _fetch_one_for_bulk(symbol):
     try:
         return get_quote(symbol)
@@ -2343,12 +2219,11 @@ def _fetch_one_for_bulk(symbol):
 def refresh_bulk_quotes():
     """Fetch a live-ish price for every symbol in the PSX directory,
     with limited concurrency, and store the result in _bulk_quote_cache.
-    Safe to call from a background thread or an on-demand route. The primary
-    market-wide quote path is the official PSX screener table; if that feed is
-    temporarily unavailable the last good full snapshot is retained, and a
-    per-company fallback is used only when there is no prior snapshot.
-    Today's returned quote fields are persisted where available so technical
-    indicators can accumulate real observations over time."""
+    Safe to call from a background thread or an on-demand route. Falls
+    back to the known FALLBACK_QUOTES symbols if the live directory
+    itself can't be reached, so the page still has something to show.
+    Also persists today's close/high/low/volume per symbol so technical
+    indicators accumulate real history over time (record_daily_prices)."""
     import concurrent.futures
 
     with _bulk_quote_lock:
@@ -2357,49 +2232,35 @@ def refresh_bulk_quotes():
         _bulk_quote_cache["in_progress"] = True
 
     try:
-        directory_meta = []
         try:
-            directory_meta = fetch_psx_symbols()
-            symbols = [row["symbol"] for row in directory_meta]
+            symbols = [row["symbol"] for row in fetch_psx_symbols()]
         except Exception:
             with _bulk_quote_lock:
                 symbols = [q.get("symbol") for q in _bulk_quote_cache["items"] if q.get("symbol")]
             if not symbols:
                 symbols = []
 
-        results, bulk_source = fetch_psx_bulk_quotes()
+        results = []
 
-        # The official screener is the fast market-wide quote path.  If it is
-        # temporarily unavailable, retain the last good snapshot instead of
-        # hammering 555 company pages.  Only when there is no prior snapshot do
-        # we fall back to the per-symbol company-page fetches.
-        if not results:
-            with _bulk_quote_lock:
-                prior = list(_bulk_quote_cache["items"])
-            if prior:
-                results = prior
-            elif symbols:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=BULK_FETCH_WORKERS) as pool:
-                    results = list(pool.map(_fetch_one_for_bulk, symbols))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=BULK_FETCH_WORKERS) as pool:
+            for quote in pool.map(_fetch_one_for_bulk, symbols):
+                results.append(quote)
 
-        # Merge the complete PSX directory metadata so the All PSX Stocks page
-        # retains company/sector information while quote fields come from the
-        # single official screener request.
-        try:
-            meta_by_symbol = {m["symbol"]: m for m in directory_meta}
-            for q in results:
-                meta = meta_by_symbol.get(q.get("symbol"), {})
-                for key in ("company", "sector"):
-                    if meta.get(key): q[key] = meta[key]
-        except Exception:
-            pass
-
+        real_results = [q for q in results if q.get("price") is not None]
         with _bulk_quote_lock:
-            _bulk_quote_cache["items"] = results
-            _bulk_quote_cache["time"] = datetime.now()
+            # A transient provider outage must never overwrite a good last
+            # session snapshot with 555 empty rows.
+            if real_results:
+                _bulk_quote_cache["items"] = results
+                _bulk_quote_cache["time"] = datetime.now()
+            elif not _bulk_quote_cache["items"]:
+                _bulk_quote_cache["items"] = results
+                _bulk_quote_cache["time"] = datetime.now()
 
         try:
-            record_daily_prices(results)
+            if real_results:
+                record_daily_prices(real_results)
+            refresh_technicals_cache([q.get("symbol") for q in results if q.get("symbol")])
         except Exception:
             pass  # never let history recording break the live-quotes flow
     finally:
@@ -2451,144 +2312,38 @@ def start_bulk_refresh_thread():
 # Fundamentals (best-effort, from the same PSX company page)
 # ---------------------------------------------------------
 
-def _stock_volume_periods(symbol):
-    """Return source-backed daily volume totals for the latest session,
-    latest 5 trading sessions and latest ~21 trading sessions. These are
-    calculated from the same real daily OHLCV history used by the charts,
-    never invented or copied from a different timeframe."""
-    try:
-        df = get_full_history_cached(symbol)
-    except Exception:
-        return {"volume_1d": None, "volume_1w": None, "volume_1m": None,
-                "avg_volume_1w": None, "avg_volume_1m": None}
-    if df is None or df.empty or "volume" not in df.columns:
-        return {"volume_1d": None, "volume_1w": None, "volume_1m": None,
-                "avg_volume_1w": None, "avg_volume_1m": None}
-    v = pd.to_numeric(df["volume"], errors="coerce").dropna()
-    if v.empty:
-        return {"volume_1d": None, "volume_1w": None, "volume_1m": None,
-                "avg_volume_1w": None, "avg_volume_1m": None}
-    last1 = v.tail(1)
-    last5 = v.tail(5)
-    last21 = v.tail(21)
-    return {
-        "volume_1d": int(last1.sum()),
-        "volume_1w": int(last5.sum()),
-        "volume_1m": int(last21.sum()),
-        "avg_volume_1w": int(last5.mean()),
-        "avg_volume_1m": int(last21.mean()),
-    }
-
-def _capital_stake_get_json(path, params):
-    if not CAPITAL_STAKE_API_TOKEN:
-        raise RuntimeError("CAPITAL_STAKE_API_TOKEN is not configured")
-    r=_http_session.get(CAPITAL_STAKE_API_BASE+path, params=params, headers={"Authorization":f"Bearer {CAPITAL_STAKE_API_TOKEN}","Accept":"application/json"}, timeout=20)
-    r.raise_for_status()
-    body=r.json()
-    if isinstance(body,dict) and str(body.get("status","ok")).lower()=="error":
-        raise RuntimeError(str(body.get("message") or body.get("error") or "Capital Stake error"))
-    return body
-
-
-def fetch_capital_stake_key_metrics(symbol):
-    """Return latest genuine Capital Stake fundamental metrics when licensed."""
-    body=_capital_stake_get_json("/company/fundamentals/key-metrics/annual", {"symbol":symbol.upper()})
-    data=body.get("data",body) if isinstance(body,dict) else {}
-    periods=data.get("periods") or []
-    rows=data.get("fundementals") or data.get("fundamentals") or []
-    out={"source":"Capital Stake / PSX licensed data","period":periods[0] if periods else None}
-    aliases={
-        "Book Value per Share (Rs.)":"book_value_per_share", "Price/Book Ratio":"price_to_book",
-        "Dividend Yield (%)":"dividend_yield_pct", "Dividend per Share (Rs.)":"dividend_per_share",
-        "Earnings per Share":"eps_ttm", "Price Earnings Ratio":"pe_ratio_ttm",
-        "Current Ratio (Times)":"current_ratio", "Long term Debt to Equity":"debt_to_equity",
-        "Return on Equity":"return_on_equity_pct", "Return on Assets":"return_on_assets_pct",
-        "Payout Ratio":"dividend_payout_pct", "Number of Shares":"shares_outstanding",
-    }
-    for row in rows:
-        name=str(row.get("name") or row.get("label") or "").strip()
-        vals=row.get("values") or []
-        key=aliases.get(name)
-        if key and vals:
-            try:
-                val=vals[0]
-                if val is not None: out[key]=float(val)
-            except Exception: pass
-    return out
-
-
 def get_fundamentals(symbol):
-    """Return source-backed PSX fundamentals and calculated TTM values.
-
-    PSX's public company page exposes annual/quarterly EPS and, for some
-    issuers, additional investment-ratio/payout fields. We parse those fields
-    when actually present. Missing fields remain null instead of being filled
-    with fabricated values.
-    """
+    """Whatever fundamental-ish fields we can pull from PSX's public
+    company page, plus clearly-labeled placeholders for the fields PSX
+    does not expose publicly (book value, dividend yield/history,
+    full financial statements). Those need a licensed data vendor —
+    the fields are kept here, set to None, so the UI has a stable
+    shape to render against once a real source is wired in."""
     quote = get_quote(symbol)
-    annual_eps = quote.get("eps_annual")
-    q_eps = quote.get("eps_quarterly") or []
-
-    # PSX company pages normally expose Q1 current year and Q1 prior year plus
-    # the latest annual EPS. This lets us derive a genuine trailing-12-month
-    # EPS when both Q1 values are available:
-    # TTM = FY prior year - Q1 prior year + Q1 current year.
-    eps_ttm = None
-    if annual_eps is not None and len(q_eps) >= 4:
-        # On PSX pages the quarterly columns are newest-first. Replace the
-        # prior-year Q1 in the latest annual EPS with the current-year Q1:
-        # TTM = FY - prior Q1 + current Q1.
-        try:
-            eps_ttm = float(annual_eps) - float(q_eps[-1]) + float(q_eps[0])
-        except (TypeError, ValueError):
-            eps_ttm = None
-
-    volume_periods = _stock_volume_periods(symbol)
-    licensed = {}
-    if CAPITAL_STAKE_API_TOKEN:
-        try:
-            licensed = fetch_capital_stake_key_metrics(symbol)
-        except Exception:
-            licensed = {}
 
     return {
         "symbol": symbol.upper(),
         "company": quote.get("company"),
         "sector": quote.get("sector"),
         "price": quote.get("price"),
-        "pe_ratio_ttm": licensed.get("pe_ratio_ttm", quote.get("pe_ratio")),
+        "pe_ratio_ttm": quote.get("pe_ratio"),
         "one_year_change_pct": quote.get("one_year_change"),
         "ytd_change_pct": quote.get("ytd_change"),
         "ldcp": quote.get("ldcp"),
         "day_range": [quote.get("day_low"), quote.get("day_high")],
         "week52_range": [quote.get("low52"), quote.get("high52")],
         "volume": quote.get("volume"),
-        "volume_30d_avg": quote.get("volume_30d_avg"),
-        **volume_periods,
-        "eps_ttm": licensed.get("eps_ttm", eps_ttm),
-        "eps_latest_annual": annual_eps,
-        "eps_quarterly": q_eps,
-        "book_value_per_share": licensed.get("book_value_per_share", quote.get("book_value_per_share")),
-        "price_to_book": licensed.get("price_to_book", quote.get("price_to_book")),
-        "dividend_yield_pct": licensed.get("dividend_yield_pct", quote.get("dividend_yield_pct") if quote.get("dividend_yield_pct") is not None else quote.get("dividend_yield")),
+        "eps_ttm": quote.get("eps_ttm"),
+        "book_value_per_share": quote.get("book_value_per_share"),
+        "dividend_yield_pct": quote.get("dividend_yield_pct"),
+        "dividend_per_share": quote.get("dividend_per_share"),
         "market_cap": quote.get("market_cap"),
         "shares_outstanding": quote.get("shares_outstanding"),
-        "free_float_shares": quote.get("free_float_shares"),
-        "free_float_pct": quote.get("free_float_pct"),
-        "face_value": quote.get("face_value"),
-        "dividend_per_share": licensed.get("dividend_per_share", quote.get("dividend_per_share")),
-        "dividend_payout_pct": licensed.get("dividend_payout_pct", quote.get("dividend_payout_pct")),
-        "debt_to_equity": licensed.get("debt_to_equity", quote.get("debt_to_equity")),
-        "current_ratio": licensed.get("current_ratio", quote.get("current_ratio")),
-        "return_on_equity_pct": licensed.get("return_on_equity_pct", quote.get("return_on_equity_pct")),
-        "return_on_assets_pct": licensed.get("return_on_assets_pct", quote.get("return_on_assets_pct")),
         "dividend_history": [],
         "source": quote.get("source"),
         "note": (
-            "Fundamental values are read from the PSX company page when that "
-            "field is actually published there. EPS is shown from PSX financial "
-            "tables; book value, dividend and ratio fields are shown whenever PSX publishes them. "
-            "Volume totals are calculated from the latest available daily OHLCV history."
+            "Fundamental values are shown only when present in the real PSX/provider response. "
+            "A dash means the source did not publish that field; the app does not invent values."
         ),
     }
 
@@ -3445,17 +3200,20 @@ def stock_detail(symbol):
 
 @app.get("/api/market")
 def market():
-    # Market-wide pages must use the same complete PSX quote snapshot as the
-    # All PSX Stocks directory. The legacy ten-symbol development dictionary
-    # is intentionally not used for market breadth or movers.
-    bulk = get_bulk_quotes()
-    stocks = bulk["items"]
-    return safe_jsonify({
+    symbols = list(FALLBACK_QUOTES.keys())
+    stocks = [get_quote(symbol) for symbol in symbols]
+
+    return jsonify({
         "kse100": KSE100,
         "stocks": stocks,
-        "updated_at": bulk["updated_at"],
-        "advancers": sum(1 for stock in stocks if (stock.get("change_pct") or 0) > 0),
-        "decliners": sum(1 for stock in stocks if (stock.get("change_pct") or 0) < 0),
+        "advancers": sum(
+            1 for stock in stocks
+            if (stock.get("change_pct") or 0) > 0
+        ),
+        "decliners": sum(
+            1 for stock in stocks
+            if (stock.get("change_pct") or 0) < 0
+        ),
     })
 
 
@@ -3545,75 +3303,27 @@ def market360():
     })
 
 
+def _recent_volume_aggregates(symbols):
+    """Aggregate recorded real daily volumes without making one DB query per stock."""
+    if not symbols:
+        return {}
+    conn = db()
+    placeholders = ",".join("?" for _ in symbols)
+    rows = conn.execute(f"SELECT symbol,day,volume FROM stock_price_history WHERE symbol IN ({placeholders}) AND volume IS NOT NULL ORDER BY day DESC", list(symbols)).fetchall()
+    conn.close()
+    grouped={}
+    for r in rows:
+        grouped.setdefault(r["symbol"], []).append(r["volume"])
+    out={}
+    for sym, vals in grouped.items():
+        out[sym]={"volume_1d": vals[0] if len(vals)>=1 else None, "volume_1w": sum(vals[:5]) if vals else None, "volume_1m": sum(vals[:22]) if vals else None, "volume_30d_avg": (sum(vals[:22])/len(vals[:22])) if vals else None}
+    return out
 
-# ---------------------------------------------------------
-# PSX market status / last-session helper
-# ---------------------------------------------------------
-PSX_MARKET_TZ = "Asia/Karachi"
-# Official 2026 PSX calendar holidays. Weekends are handled separately.
-# Keeping the list local avoids making the ticker dependent on a second
-# network request just to decide whether today's market is closed.
-PSX_2026_HOLIDAYS = {
-    "2026-02-05", "2026-03-20", "2026-03-21", "2026-03-22", "2026-03-23",
-    "2026-05-01", "2026-05-28", "2026-05-26", "2026-05-27", "2026-05-28",
-    "2026-06-25", "2026-06-26", "2026-08-14", "2026-08-25",
-    "2026-11-09", "2026-12-25",
-}
-
-def _psx_now():
-    if ZoneInfo:
-        return datetime.now(ZoneInfo(PSX_MARKET_TZ))
-    return datetime.now()
-
-def _psx_is_holiday(d):
-    return d.isoformat() in PSX_2026_HOLIDAYS
-
-def _psx_regular_open(now):
-    # Current PSX regular-market schedule: Mon-Thu 09:32-15:30;
-    # Friday has two sessions, 09:17-12:00 and 14:32-16:30.
-    if now.weekday() >= 5 or _psx_is_holiday(now.date()):
-        return False
-    mins = now.hour * 60 + now.minute
-    if now.weekday() < 4:
-        return 9*60+32 <= mins < 15*60+30
-    return (9*60+17 <= mins < 12*60) or (14*60+32 <= mins < 16*60+30)
-
-def _previous_psx_session(d):
-    cur = d - timedelta(days=1)
-    while cur.weekday() >= 5 or _psx_is_holiday(cur):
-        cur -= timedelta(days=1)
-    return cur
-
-def psx_market_status():
-    now = _psx_now()
-    prev = _previous_psx_session(now.date()) if not _psx_is_holiday(now.date()) else _previous_psx_session(now.date())
-    is_open = _psx_regular_open(now)
-    if is_open:
-        label = "Market open"
-    elif now.weekday() >= 5 or _psx_is_holiday(now.date()):
-        label = "Market closed"
-    else:
-        label = "Market closed · outside regular session"
-    return {
-        "is_open": is_open,
-        "label": label,
-        "now": now.isoformat(),
-        "last_session_date": prev.isoformat(),
-        "timezone": PSX_MARKET_TZ,
-        "source": "PSX official trading-hours schedule",
-    }
 
 @app.get("/api/stocks/live")
 def stocks_live():
     try:
-        status = psx_market_status()
         bulk = get_bulk_quotes()
-        # A cold Render instance can have an empty in-memory quote cache. Do
-        # one real full-universe fetch so the ticker does not sit on "warming"
-        # indefinitely. Once populated, subsequent calls are cache-backed.
-        if not bulk.get("items"):
-            refresh_bulk_quotes()
-            bulk = get_bulk_quotes()
         progress = get_recording_progress()
 
         with _technicals_cache_lock:
@@ -3623,9 +3333,11 @@ def stocks_live():
             row["symbol"]: row["funds"] for row in TOP_STOCKS_THREE_WAYS["fund_holdings"]
         }
 
+        volume_aggs = _recent_volume_aggregates([q.get("symbol") for q in bulk["items"] if q.get("symbol")])
         items = []
         for q in bulk["items"]:
             t = cache_snapshot.get(q.get("symbol"))
+            va = volume_aggs.get(q.get("symbol"), {})
             items.append({
                 **q,
                 "rsi14": t.get("rsi14") if t else None,
@@ -3634,14 +3346,31 @@ def stocks_live():
                 "golden_death_cross": t.get("golden_death_cross") if t else None,
                 "data_days": t.get("data_days") if t else 0,
                 "funds_holding": fund_holders.get(q.get("symbol")),
+                "volume_1d": va.get("volume_1d") or q.get("volume"),
+                "volume_1w": va.get("volume_1w"),
+                "volume_1m": va.get("volume_1m"),
+                "volume_30d_avg": va.get("volume_30d_avg"),
             })
+
+        now_pk = datetime.now(ZoneInfo("Asia/Karachi"))
+        in_session = now_pk.weekday() < 5 and (now_pk.hour > 9 or (now_pk.hour == 9 and now_pk.minute >= 30)) and (now_pk.hour < 15 or (now_pk.hour == 15 and now_pk.minute <= 30))
+        valid_items = [q for q in bulk["items"] if q.get("price") is not None]
+        if valid_items and in_session:
+            market_state = "LIVE"
+            market_message = "PSX live/most-recent session data"
+        elif valid_items:
+            market_state = "CLOSED"
+            market_message = "PSX market is closed; showing the last successful session."
+        else:
+            market_state = "FEED_UNAVAILABLE"
+            market_message = "No real PSX quote data is currently available from the supported feeds."
 
         return safe_jsonify({
             "items": items,
             "updated_at": bulk["updated_at"],
-            "source": (items[0].get("source") if items else "PSX official market feed"),
             "recording_progress": progress,
-            "market_status": status,
+            "market_state": market_state,
+            "market_message": market_message,
             "fund_holdings_note": (
                 "Fund-holder counts are only tracked for a handful of top stocks "
                 "(from the Markets page's 'Top Stocks, Three Ways' — see "
@@ -3711,108 +3440,75 @@ TECHNICAL_CRITERIA_KEYS = {
 }
 
 
-def _save_screener_result(cache_key, criteria, data):
-    saved_at = datetime.now().astimezone().isoformat(timespec="seconds")
+def _load_persisted_screener(cache_key):
     try:
         conn = db()
-        conn.execute(
-            "INSERT INTO screener_results(cache_key,screener_name,criteria_json,result_json,saved_at) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json,criteria_json=excluded.criteria_json,saved_at=excluded.saved_at",
-            (cache_key, "PSX Stock Screener", json.dumps(criteria, sort_keys=True, separators=(",", ":")), json.dumps(_clean_for_json(data), separators=(",", ":")), saved_at),
-        )
-        conn.execute(
-            "INSERT INTO screener_results(cache_key,screener_name,criteria_json,result_json,saved_at) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json,criteria_json=excluded.criteria_json,saved_at=excluded.saved_at",
-            ("psx_screener_latest", "PSX Stock Screener", json.dumps(criteria, sort_keys=True, separators=(",", ":")), json.dumps(_clean_for_json(data), separators=(",", ":")), saved_at),
-        )
+        row = conn.execute("SELECT result_json, saved_at FROM screener_runs WHERE cache_key=?", (cache_key,)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {"data": json.loads(row["result_json"]), "saved_at": row["saved_at"]}
+    except Exception:
+        return None
+
+
+def _save_persisted_screener(cache_key, criteria, data):
+    saved_at = datetime.now(ZoneInfo("Asia/Karachi")).isoformat(timespec="seconds")
+    try:
+        conn = db()
+        conn.execute("INSERT INTO screener_runs(cache_key,criteria_json,result_json,saved_at) VALUES(?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json,saved_at=excluded.saved_at,criteria_json=excluded.criteria_json", (cache_key, json.dumps(criteria, sort_keys=True), json.dumps(_clean_for_json(data), separators=(",",":")), saved_at))
         conn.commit(); conn.close()
     except Exception:
         pass
-    data["saved_at"] = saved_at
-    return data
-
-@app.get("/api/screener/stock-verdict/<symbol>")
-def screener_stock_verdict(symbol):
-    """Explain every live technical-screener point for one PSX stock.
-
-    This is an audit-style verdict, not a generic score: each criterion has
-    the actual measured value, pass/fail/unavailable state and a short reason.
-    The personalized divergence setup is included separately when enough
-    genuine daily history exists.
-    """
-    sym=symbol.upper().strip()
-    try:
-        tech=compute_technicals(sym)
-        quote=get_quote(sym)
-        conditions=[]
-        def add(key,label,passed,value,rule):
-            conditions.append({"key":key,"label":label,"passed":passed if passed is not None else None,"value":value,"rule":rule})
-        price=tech.get("price")
-        add("ema20","Price above EMA20", tech.get("above_ema20"), tech.get("ema20"), "Close > EMA20")
-        add("sma50","Price above SMA50", tech.get("above_sma50"), tech.get("sma50"), "Close > SMA50")
-        add("sma100","Price above SMA100", (price is not None and tech.get("sma100") is not None and price>tech["sma100"]) if tech.get("sma100") is not None else None, tech.get("sma100"), "Close > SMA100")
-        add("sma200","Price above SMA200", tech.get("above_sma200"), tech.get("sma200"), "Close > SMA200")
-        add("golden_cross","Golden Cross", tech.get("golden_death_cross")=="golden_cross" if tech.get("golden_death_cross") is not None else None, tech.get("golden_death_cross"), "SMA50 crosses above SMA200")
-        add("death_cross","Death Cross", tech.get("golden_death_cross")=="death_cross" if tech.get("golden_death_cross") is not None else None, tech.get("golden_death_cross"), "SMA50 crosses below SMA200")
-        add("rsi_oversold","RSI oversold", tech.get("rsi_oversold"), tech.get("rsi14"), "RSI(14) ≤ 30")
-        add("rsi_overbought","RSI overbought", tech.get("rsi_overbought"), tech.get("rsi14"), "RSI(14) ≥ 70")
-        add("macd_bullish","MACD bullish", tech.get("macd_bullish"), tech.get("macd_histogram"), "MACD histogram > 0")
-        add("obv","OBV available", tech.get("obv") is not None, tech.get("obv"), "Real OHLCV volume is available for OBV")
-        vol=quote.get("volume")
-        add("high_volume","High volume", (vol is not None and vol>=5_000_000) if vol is not None else None, vol, "Latest volume ≥ 5,000,000")
-        low52,high52=quote.get("low52"),quote.get("high52")
-        pos=((price-low52)/(high52-low52)*100) if price is not None and low52 is not None and high52 is not None and high52>low52 else None
-        add("near_52w_low","Near 52-week low", pos is not None and pos<=10 if pos is not None else None, pos, "Price is in the bottom 10% of its 52-week range")
-        add("near_52w_high","Near 52-week high", pos is not None and pos>=90 if pos is not None else None, pos, "Price is in the top 10% of its 52-week range")
-        personalized=None
-        try:
-            full=get_divergence_history_cached(sym)
-            if full is not None and len(full)>=PSX_DIVERGENCE_MIN_TRADING_DAYS:
-                start=full["date"].min().date().isoformat()
-                analysis=_analyze_one_psx_divergence_symbol(sym,start)
-                b=analysis.get("base_info") or {}
-                personalized={
-                    "near_52w_low": bool(analysis.get("is_near_low")),
-                    "bullish_divergence_1d": b.get("div_1d")=="Bullish",
-                    "bullish_divergence_1w": b.get("div_1w")=="Bullish",
-                    "bullish_divergence_1m": b.get("div_1m")=="Bullish",
-                    "bearish_divergence_1d": b.get("div_1d")=="Bearish",
-                    "bearish_divergence_1w": b.get("div_1w")=="Bearish",
-                    "bearish_divergence_1m": b.get("div_1m")=="Bearish",
-                    "bullish_rsi_50": b.get("bullish_rsi_50"), "bullish_rsi_30": b.get("bullish_rsi_30"),
-                    "bearish_rsi_70": b.get("bearish_rsi_70"), "bearish_rsi_90": b.get("bearish_rsi_90"),
-                    "heikin_ashi": b.get("ha_color"), "structure": b.get("structure"),
-                    "personalized_match": b.get("personalized_match"), "setup": b.get("personalized_setup"),
-                }
-        except Exception as exc:
-            personalized={"available":False,"error":str(exc)}
-        passed=sum(1 for c in conditions if c["passed"] is True)
-        failed=sum(1 for c in conditions if c["passed"] is False)
-        unavailable=sum(1 for c in conditions if c["passed"] is None)
-        return safe_jsonify({"ok":True,"symbol":sym,"company":quote.get("company"),"price":price,"conditions":conditions,"summary":{"passed":passed,"failed":failed,"unavailable":unavailable,"total":len(conditions)},"personalized_setup":personalized,"data_days":tech.get("data_days"),"source":quote.get("source")})
-    except Exception as exc:
-        return safe_jsonify({"ok":False,"symbol":sym,"error":str(exc)}),200
+    return saved_at
 
 
 @app.get("/api/screener/last")
 def screener_last():
     try:
         conn = db()
-        row = conn.execute("SELECT result_json, criteria_json, saved_at FROM screener_results WHERE cache_key=?", ("psx_screener_latest",)).fetchone()
+        row = conn.execute("SELECT criteria_json,result_json,saved_at FROM screener_runs ORDER BY id DESC LIMIT 1").fetchone()
         conn.close()
         if not row:
-            return safe_jsonify({"ok": True, "found": False})
-        return safe_jsonify({"ok": True, "found": True, "result": json.loads(row["result_json"]), "criteria": json.loads(row["criteria_json"] or "{}"), "saved_at": row["saved_at"]})
+            return safe_jsonify({"found": False})
+        return safe_jsonify({"found": True, "criteria": json.loads(row["criteria_json"]), "data": json.loads(row["result_json"]), "saved_at": row["saved_at"]})
     except Exception as exc:
-        return safe_jsonify({"ok": False, "found": False, "error": str(exc)})
+        return safe_jsonify({"found": False, "error": str(exc)})
 
-@app.post("/api/screener/last/clear")
-def screener_last_clear():
+
+@app.post("/api/screener/check-stock")
+def screener_check_stock():
+    body = request.get_json(silent=True) or {}
+    symbol = str(body.get("symbol") or "").strip().upper()
+    criteria = body.get("criteria") or {}
+    if not symbol:
+        return safe_jsonify({"ok": False, "error": "Symbol is required."}), 400
+    quote = get_quote(symbol)
     try:
-        conn = db(); conn.execute("DELETE FROM screener_results WHERE cache_key=?", ("psx_screener_latest",)); conn.commit(); conn.close()
+        technical = compute_technicals(symbol)
     except Exception:
-        pass
-    return safe_jsonify({"ok": True})
+        technical = {}
+    row = {**quote, **technical}
+    checks=[]
+    for key, label, predicate in [
+        ("above_sma20", "Above SMA20", lambda r: r.get("above_sma20") is True),
+        ("above_sma50", "Above SMA50", lambda r: r.get("above_sma50") is True),
+        ("above_sma200", "Above SMA200", lambda r: r.get("above_sma200") is True),
+        ("above_ema20", "Above EMA20", lambda r: r.get("above_ema20") is True),
+        ("golden_cross", "Golden Cross", lambda r: r.get("golden_death_cross") == "golden"),
+        ("death_cross", "Death Cross", lambda r: r.get("golden_death_cross") == "death"),
+        ("macd_bullish", "MACD Bullish", lambda r: r.get("macd_bullish") is True),
+        ("rsi_oversold", "RSI ≤ 30", lambda r: r.get("rsi14") is not None and r.get("rsi14") <= 30),
+        ("rsi_overbought", "RSI ≥ 70", lambda r: r.get("rsi14") is not None and r.get("rsi14") >= 70),
+    ]:
+        if key in criteria and criteria[key]:
+            checks.append({"key": key, "label": label, "matched": bool(predicate(row))})
+    if "rsi_min" in criteria and criteria["rsi_min"] is not None:
+        checks.append({"key":"rsi_min","label":f"RSI ≥ {criteria['rsi_min']}","matched":row.get("rsi14") is not None and row.get("rsi14") >= float(criteria["rsi_min"])})
+    if "rsi_max" in criteria and criteria["rsi_max"] is not None:
+        checks.append({"key":"rsi_max","label":f"RSI ≤ {criteria['rsi_max']}","matched":row.get("rsi14") is not None and row.get("rsi14") <= float(criteria["rsi_max"])})
+    return safe_jsonify({"ok": True, "symbol": symbol, "quote": quote, "checks": checks, "matched": sum(1 for c in checks if c["matched"]), "total": len(checks)})
+
 
 @app.post("/api/screener/run")
 def screener_run():
@@ -3832,31 +3528,15 @@ def screener_run():
         hit = _screener_result_cache.get(cache_key)
         if hit and now - hit["time"] < SCREENER_CACHE_SECONDS:
             return safe_jsonify(hit["data"])
-    # Survive a Gunicorn/Render process restart: restore the exact last run
-    # for this criteria from SQLite instead of forcing another market-wide
-    # calculation.
-    try:
-        conn = db()
-        row = conn.execute("SELECT result_json FROM screener_results WHERE cache_key=?", (cache_key,)).fetchone()
-        conn.close()
-        if row:
-            persisted = json.loads(row["result_json"])
-            with _screener_cache_lock:
-                _screener_result_cache[cache_key] = {"time": now, "data": persisted}
-            return safe_jsonify(persisted)
-    except Exception:
-        pass
 
+    persisted = _load_persisted_screener(cache_key)
     bulk = get_bulk_quotes()
-    if not bulk["items"]:
-        try:
-            bulk = get_bulk_quotes(force=True)
-        except Exception:
-            pass
+    if persisted and not bulk["items"]:
+        data = persisted["data"]
+        data["last_scan_at"] = persisted["saved_at"]
+        data["stale"] = True
+        return safe_jsonify(data)
     items = bulk["items"]
-
-    if not items:
-        return safe_jsonify({"count": 0, "scanned": 0, "updated_at": bulk.get("updated_at"), "warming_up": True, "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"), "results": [], "error": "The complete PSX quote universe is still warming up; no partial/development universe was used."})
 
     if TECHNICAL_CRITERIA_KEYS & set(criteria.keys()):
         symbols = [q.get("symbol") for q in items if q.get("symbol")]
@@ -3903,8 +3583,10 @@ def screener_run():
         "warming_up": bulk["updated_at"] is None,
         "results": results[:200],
     }
+    saved_at = _save_persisted_screener(cache_key, criteria, data)
+    data["last_scan_at"] = saved_at
+    data["stale"] = False
 
-    data = _save_screener_result(cache_key, criteria, data)
     with _screener_cache_lock:
         _screener_result_cache[cache_key] = {"time": now, "data": data}
 
@@ -4112,37 +3794,6 @@ def _parse_company_announcements(html, symbol, limit=50):
     return out
 
 
-def _parse_psx_announcement_table(html, category="Company Announcement", limit=80):
-    """Parse PSX announcement tables without depending on one fragile CSS
-    shape. Show announcement text/date directly and preserve a document link
-    whenever PSX exposes one."""
-    soup = BeautifulSoup(html, "html.parser")
-    out, seen = [], set()
-    for row in soup.find_all("tr"):
-        cells = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["td", "th"])]
-        if len(cells) < 2:
-            continue
-        links = row.find_all("a", href=True)
-        href = links[-1].get("href") if links else None
-        if href:
-            if href.startswith("/"): href = PSX_ALT_BASE + href
-            elif href.startswith("http://"): href = "https://" + href[7:]
-        symbol = next((c.strip().upper() for c in cells if re.fullmatch(r"[A-Z0-9&.\-]{1,30}", c.strip().upper())), None)
-        date_text = next((c for c in cells if re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", c, re.I)), None)
-        low = " | ".join(cells).lower()
-        if any(x in low for x in ("announcement type", "company symbol", "keyword")) and not href:
-            continue
-        title = cells[-1] if cells[-1] else "PSX announcement"
-        key = (symbol or "", title, date_text or "", href or "")
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"symbol": symbol, "title": title[:500], "date": date_text, "category": category, "url": href, "text": " | ".join(cells)[:1000]})
-        if len(out) >= limit:
-            break
-    return out
-
-
 @app.get("/api/psx/announcements")
 def psx_announcements():
     symbol = request.args.get("symbol", "").strip().upper()
@@ -4154,112 +3805,30 @@ def psx_announcements():
             result["announcements"] = _parse_company_announcements(html, symbol, limit)
             result["source_url"] = source_url
         else:
-            categories = [
-                ("Company Announcements", "/announcements/companies"),
-                ("PSX Notices", "/announcements/psx"),
-                ("Corporate Briefing Sessions", "/announcements/cbs"),
-                ("CDC Notices", "/announcements/cdc"),
-                ("SECP Notices", "/announcements/secp"),
-                ("NCCPL Notices", "/announcements/nccpl"),
-                ("Payouts", "/announcements/payouts"),
-            ]
-            import concurrent.futures
-            def fetch_category(item):
-                label, path = item
-                try:
-                    html, url = _fetch_psx_html([PSX_ALT_BASE + path, "https://dps.psx.com.pk" + path], timeout=8)
-                    return label, url, _parse_psx_announcement_table(html, label, limit)
-                except Exception:
-                    return label, None, []
-            rows=[]; sources=[]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                for label, url, parsed in pool.map(fetch_category, categories):
-                    if url: sources.append(url)
-                    rows.extend(parsed)
-            result["announcements"] = rows[:limit]
-            result["source_url"] = sources[0] if sources else None
+            html, source_url = _fetch_psx_html(["https://dps.csapis.com/announcements/companies", "https://dps.psx.com.pk/announcements/companies"], timeout=10)
+            soup = BeautifulSoup(html, "html.parser")
+            rows=[]; seen=set()
+            for row in soup.find_all("tr"):
+                cells=[" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["td","th"])]
+                if len(cells) < 4: continue
+                links=row.find_all("a", href=True)
+                href=next((a.get("href") for a in links if "download" in str(a.get("href")).lower() or "pdf" in str(a.get("href")).lower()), None)
+                if not href: continue
+                symbol_cell=next((c for c in cells if re.fullmatch(r"[A-Z0-9&.\-]{1,30}", c.strip())), "")
+                if not symbol_cell: continue
+                title=cells[-1] if cells[-1] else "PSX announcement"
+                if href.startswith("/"): href=PSX_ALT_BASE+href
+                elif href.startswith("http://"): href="https://"+href[7:]
+                key=(symbol_cell,title,href)
+                if key in seen: continue
+                seen.add(key); rows.append({"symbol":symbol_cell,"title":" | ".join(cells),"url":href})
+                if len(rows)>=limit: break
+            result["announcements"]=rows; result["source_url"]=source_url
         result["available"] = bool(result["announcements"])
     except Exception as exc:
         result["ok"] = False; result["error"] = str(exc)
     return safe_jsonify(result)
 
-
-
-@app.get("/api/psx/insider-transactions")
-def psx_insider_transactions():
-    """Live PSX insider/director-interest disclosure feed.
-
-    PSX publishes these as company announcements under the disclosure-of-
-    interest provisions. The page intentionally shows the actual filing title,
-    date and document link; it does not invent buy/sell quantities when the
-    filing document has not been parsed.
-    """
-    symbol = request.args.get("symbol", "").strip().upper()
-    limit = min(max(int(request.args.get("limit", 80) or 80), 1), 100)
-    keywords = (
-        "disclosure of interest",
-        "director", "ceo", "executive", "substantial shareholder",
-        "presentation of trades", "shares purchased", "shares sold",
-        "insider",
-    )
-    result = {
-        "ok": True, "symbol": symbol or None, "source": "Pakistan Stock Exchange",
-        "transactions": [], "available": False,
-        "note": "PSX publishes insider/director dealings through company disclosures. Filing details are shown exactly as published; quantities are not inferred from titles.",
-    }
-    try:
-        if CAPITAL_STAKE_API_TOKEN:
-            try:
-                path = "/insider/symbol" if symbol else "/insider"
-                body = _capital_stake_get_json(path, {"symbol": symbol} if symbol else {})
-                raw = body.get("data", []) if isinstance(body, dict) else []
-                if isinstance(raw, dict): raw = raw.get("data") or raw.get("items") or []
-                for x in raw[:limit]:
-                    tx = dict(x)
-                    typ = str(tx.get("type") or tx.get("direction") or "").lower()
-                    tx["direction"] = "buy" if "buy" in typ or "purchase" in typ else ("sell" if "sell" in typ else "disclosure")
-                    tx["title"] = tx.get("description") or f"{tx.get('type','Disclosure')} — {tx.get('name','PSX insider')}"
-                    result["transactions"].append(tx)
-                result["available"] = bool(result["transactions"])
-                result["source"] = "Capital Stake / PSX licensed insider feed"
-                result["note"] = "Genuine PSX insider transactions from the licensed Capital Stake feed, including transaction type, insider name, price and shares when published."
-                return safe_jsonify(result)
-            except Exception as licensed_exc:
-                result["licensed_error"] = str(licensed_exc)
-        if symbol:
-            html, source_url = _fetch_psx_html(
-                [PSX_ALT_COMPANY_URL.format(symbol=symbol), PSX_COMPANY_URL.format(symbol=symbol)],
-                timeout=10,
-            )
-            rows = _parse_company_announcements(html, symbol, 100)
-        else:
-            html, source_url = _fetch_psx_html(
-                [PSX_ALT_BASE + "/announcements/companies", "https://dps.psx.com.pk/announcements/companies"],
-                timeout=10,
-            )
-            rows = _parse_psx_announcement_table(html, "Company Announcements", 150)
-        rows = [
-            r for r in rows
-            if any(k in (r.get("title") or r.get("text") or "").lower() for k in keywords)
-        ]
-        for r in rows[:limit]:
-            title = r.get("title") or r.get("text") or "PSX insider disclosure"
-            low = title.lower()
-            if "purchase" in low or "purchased" in low or "buy" in low:
-                direction = "buy"
-            elif "sale" in low or "sold" in low or "sell" in low:
-                direction = "sell"
-            else:
-                direction = "disclosure"
-            r = dict(r)
-            r["direction"] = direction
-            result["transactions"].append(r)
-        result["available"] = bool(result["transactions"])
-        result["source_url"] = source_url
-    except Exception as exc:
-        result["ok"] = False
-        result["error"] = str(exc)
-    return safe_jsonify(result)
 
 @app.get("/api/psx/financials")
 def psx_financials():
@@ -4458,8 +4027,11 @@ def search_all():
         live_by_symbol = {x["symbol"]: x for x in live_quotes}
         try:
             symbol_rows = fetch_psx_symbols()
-        except Exception:
-            symbol_rows = []
+        except requests.RequestException:
+            symbol_rows = [
+                {"symbol": sym, "company": data["company"], "sector": data.get("sector", "")}
+                for sym, data in FALLBACK_QUOTES.items()
+            ]
         for row in symbol_rows:
             if q in row["symbol"].upper() or q in row["company"].upper():
                 match = live_by_symbol.get(row["symbol"])
@@ -4673,8 +4245,8 @@ def add_transaction():
 
     try:
         valid = {item["symbol"] for item in fetch_psx_symbols()}
-    except Exception:
-        return safe_jsonify({"error": "PSX symbol directory is temporarily unavailable; transaction was not saved."}), 503
+    except requests.RequestException:
+        valid = set(FALLBACK_QUOTES.keys())
 
     if symbol not in valid:
         return jsonify({"error": "Symbol not found in PSX directory"}), 400
@@ -4971,13 +4543,32 @@ def _get_tech_job(job_id):
 
 
 def _save_tech_cache(name, data):
+    saved_at = datetime.now(ZoneInfo("Asia/Karachi")).isoformat(timespec="seconds")
     with _tech_scan_cache_lock:
-        _tech_scan_cache[name] = {"data": data, "saved_at": datetime.utcnow().isoformat() + "Z"}
+        _tech_scan_cache[name] = {"data": data, "saved_at": saved_at}
+    # Also persist the latest completed technical scan in SQLite.  If the
+    # database lives on a Render persistent disk, the result survives restart.
+    try:
+        key = "__tech__:" + name
+        conn = db()
+        conn.execute("INSERT INTO screener_runs(cache_key,criteria_json,result_json,saved_at) VALUES(?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json,saved_at=excluded.saved_at", (key, "{}", json.dumps(_clean_for_json(data), separators=(",",":")), saved_at))
+        conn.commit(); conn.close()
+    except Exception:
+        pass
 
 
 def _load_tech_cache(name):
     with _tech_scan_cache_lock:
-        return _tech_scan_cache.get(name)
+        hit = _tech_scan_cache.get(name)
+    if hit:
+        return hit
+    try:
+        conn = db(); row = conn.execute("SELECT result_json,saved_at FROM screener_runs WHERE cache_key=?", ("__tech__:" + name,)).fetchone(); conn.close()
+        if row:
+            return {"data": json.loads(row["result_json"]), "saved_at": row["saved_at"]}
+    except Exception:
+        pass
+    return None
 
 
 def _run_tech_job_in_background(job_id, cache_name, symbols, timeframes):
@@ -5073,9 +4664,9 @@ def api_cryptotech_scan_cached():
 
 PSX_DIVERGENCE_NEAR_LOW_PCT = getattr(core, "NEAR_LOW_PCT", 3.0)
 PSX_DIVERGENCE_LOOKBACK_DAYS = getattr(core, "DIVERGENCE_LOOKBACK_DAYS", 90)
-PSX_DIVERGENCE_SWING_ORDER = getattr(core, "SWING_ORDER", 5)
-PSX_STRUCTURE_LOOKBACK_DAYS = getattr(core, "STRUCTURE_LOOKBACK_DAYS", 180)
-PSX_STRUCTURE_SWING_ORDER = getattr(core, "STRUCTURE_SWING_ORDER", 5)
+PSX_DIVERGENCE_SWING_ORDER = getattr(core, "SWING_ORDER", 8)
+PSX_STRUCTURE_LOOKBACK_DAYS = getattr(core, "STRUCTURE_LOOKBACK_DAYS", 150)
+PSX_STRUCTURE_SWING_ORDER = getattr(core, "STRUCTURE_SWING_ORDER", 8)
 PSX_DIVERGENCE_HISTORY_DAYS = getattr(core, "HISTORY_DAYS", 420)
 PSX_DIVERGENCE_MIN_TRADING_DAYS = getattr(core, "MIN_TRADING_DAYS", 100)
 PSX_DIVERGENCE_PRICE_BASIS = getattr(core, "PRICE_BASIS", "close")
@@ -5090,7 +4681,7 @@ PSX_HISTORY_COLUMN_MAP = {
 def fetch_psx_scraper_history(symbol):
     response = _http_session.get(
         f"{PSX_SCRAPER_API_BASE}/stocks/{symbol.upper()}/history",
-        params={"period": "15y", "interval": "daily"},
+        params={"period": "5y", "interval": "daily"},
         headers={"Accept": "application/json", "User-Agent": HEADERS["User-Agent"]},
         timeout=20,
     )
@@ -5151,196 +4742,44 @@ def _sanitize_ohlcv(df):
     return df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
 
 
-def _normalize_intraday_payload(payload, symbol):
-    """Normalize common Capital Stake/JSON OHLCV response shapes."""
-    if not isinstance(payload, dict):
-        raise RuntimeError("Intraday provider returned a non-JSON payload")
-    if str(payload.get("status", "ok")).lower() == "error":
-        raise RuntimeError(str(payload.get("message") or payload.get("error") or "provider error"))
-    data = payload.get("data", payload)
-    rows = []
-    if isinstance(data, dict):
-        for key in ("candles", "bars", "ohlcv", "series", "items", "data", "rows"):
-            if isinstance(data.get(key), list):
-                rows = data[key]; break
-        if not rows and all(k in data for k in ("timestamp", "open", "high", "low", "close")):
-            rows = [data]
-    elif isinstance(data, list):
-        rows = data
-    if not rows:
-        raise RuntimeError("Intraday provider returned no OHLCV bars")
-    out=[]
-    for row in rows:
-        if isinstance(row, (list, tuple)) and len(row) >= 5:
-            ts,o,h,l,c = row[:5]; v = row[5] if len(row) > 5 else None
-        elif isinstance(row, dict):
-            ts = row.get("timestamp") or row.get("time") or row.get("datetime") or row.get("date") or row.get("t")
-            o = row.get("open") if row.get("open") is not None else row.get("o")
-            h = row.get("high") if row.get("high") is not None else row.get("h")
-            l = row.get("low") if row.get("low") is not None else row.get("l")
-            c = row.get("close") if row.get("close") is not None else row.get("c")
-            v = row.get("volume") if row.get("volume") is not None else row.get("v")
-        else:
-            continue
-        if ts is None: continue
-        try:
-            tsn=float(ts)
-            # Unix milliseconds are common in exchange APIs.
-            if tsn > 10_000_000_000: tsn /= 1000.0
-            dt=pd.to_datetime(tsn, unit="s", utc=True).tz_convert(None)
-        except Exception:
-            dt=pd.to_datetime(ts, errors="coerce", utc=True).tz_convert(None)
-        out.append({"date":dt,"open":o,"high":h,"low":l,"close":c,"volume":v})
-    df=pd.DataFrame(out, columns=["date","open","high","low","close","volume"])
-    for c in ("open","high","low","close","volume"):
-        df[c]=pd.to_numeric(df[c], errors="coerce")
-    df=df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
-    df=_sanitize_ohlcv(df)
-    if len(df) < 5:
-        raise RuntimeError(f"Only {len(df)} valid intraday candles returned")
-    return df
-
-
-def fetch_capital_stake_psx_intraday(symbol, interval="5m", lookback_days=7):
-    """Fetch genuine PSX intraday OHLCV from Capital Stake when licensed.
-
-    Capital Stake documents 1m/5m/15m PSX bars and requires a Bearer token.
-    We request 5m bars and may aggregate them locally into genuine 1h/5h bars;
-    aggregation does not invent prices because every resulting OHLCV bar is
-    built from real exchange-derived source bars.
-    """
-    if not CAPITAL_STAKE_API_TOKEN:
-        raise RuntimeError("CAPITAL_STAKE_API_TOKEN is not configured")
-    interval = interval.lower()
-    if interval not in {"1m","5m","15m"}:
-        raise ValueError("Capital Stake intraday source supports 1m, 5m or 15m input bars")
-    url = CAPITAL_STAKE_API_BASE + CAPITAL_STAKE_CHART_ENDPOINT
-    headers={"Authorization":f"Bearer {CAPITAL_STAKE_API_TOKEN}","Accept":"application/json"}
-    params={"symbol":symbol.upper(),"interval":interval}
-    # APIs vary on lookback parameter names; the first documented/simple form
-    # is used, and the provider may ignore it while returning its allowed window.
-    params["days"] = int(max(1, lookback_days))
-    r=_http_session.get(url, params=params, headers=headers, timeout=20)
-    r.raise_for_status()
-    return _normalize_intraday_payload(r.json(), symbol)
-
-
-def fetch_twelve_data_psx_intraday(symbol, interval="1h", outputsize=5000):
-    """Fetch genuine PSX intraday bars from Twelve Data's XKAR coverage.
-    No interpolation/resampling is done here; the returned interval is the
-    provider's actual interval. Requires TWELVE_DATA_API_KEY.
-    """
-    if not TWELVE_DATA_API_KEY:
-        raise RuntimeError("TWELVE_DATA_API_KEY is not configured")
-    td_interval={"1m":"1min","5m":"5min","15m":"15min","30m":"30min","1h":"1h","5h":"5h"}.get(interval,interval)
-    r=_http_session.get("https://api.twelvedata.com/time_series", params={
-        "symbol":symbol.upper(), "exchange":"XKAR", "interval":td_interval,
-        "outputsize":min(int(outputsize),5000), "order":"ASC", "apikey":TWELVE_DATA_API_KEY,
-        "timezone":"UTC",
-    }, headers={"Accept":"application/json"}, timeout=20)
-    r.raise_for_status(); body=r.json()
-    if body.get("status")=="error" or body.get("code"):
-        raise RuntimeError(str(body.get("message") or body.get("code") or "Twelve Data error"))
-    values=body.get("values") or []
-    if not values: raise RuntimeError("Twelve Data returned no intraday bars")
-    rows=[]
-    for x in values:
-        rows.append({"date":pd.to_datetime(x.get("datetime"),errors="coerce",utc=True).tz_convert(None),
-                     "open":x.get("open"),"high":x.get("high"),"low":x.get("low"),"close":x.get("close"),"volume":x.get("volume")})
-    df=pd.DataFrame(rows);
-    for c in ("open","high","low","close","volume"): df[c]=pd.to_numeric(df[c],errors="coerce")
-    df=_sanitize_ohlcv(df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
-    if len(df)<5: raise RuntimeError(f"Twelve Data returned only {len(df)} valid candles")
-    df.attrs["source"]="Twelve Data / XKAR"; df.attrs["source_interval"]=interval
-    return df
-
-
-def fetch_yahoo_psx_intraday(symbol, interval="5m", period="1d"):
-    """Fetch genuine PSX intraday OHLCV with a strict no-fake source chain.
-
-    Preferred source: licensed Capital Stake 5m exchange-derived bars when
-    CAPITAL_STAKE_API_TOKEN is configured. Fallback: Yahoo's genuine 60m/
-    intraday feed. If neither source has real intraday bars, the function
-    raises an error; it NEVER substitutes daily candles.
-    """
+def fetch_yahoo_psx_intraday(symbol, interval="60m", period="60d"):
+    """Fetch genuine intraday OHLCV from Yahoo's PSX .KA chart feed.
+    We never manufacture hourly candles from daily data."""
     symbol = symbol.upper().strip()
-    allowed = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
-    if interval not in allowed:
-        raise ValueError(f"Unsupported intraday interval: {interval}")
-    errors=[]
+    response = _http_session.get(
+        YAHOO_CHART_URL.format(symbol=symbol),
+        params={"range": period, "interval": interval, "events": "div,splits"},
+        headers={**HEADERS, "Accept": "application/json,text/plain,*/*"}, timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    result = ((payload.get("chart") or {}).get("result") or [None])[0]
+    if not result:
+        raise RuntimeError("Yahoo returned no genuine intraday chart for this PSX symbol")
+    ts = result.get("timestamp") or []
+    q = (((result.get("indicators") or {}).get("quote") or [None])[0]) or {}
+    if not ts or not q.get("close"):
+        raise RuntimeError("No genuine intraday OHLCV returned by Yahoo")
+    df = pd.DataFrame({"date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None),
+                       "open": q.get("open", []), "high": q.get("high", []),
+                       "low": q.get("low", []), "close": q.get("close", []),
+                       "volume": q.get("volume", [])})
+    for c in ("open","high","low","close","volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df = _sanitize_ohlcv(df)
+    if len(df) < CHART_MIN_CANDLES:
+        raise RuntimeError("Too few genuine intraday candles returned by Yahoo")
+    return df
 
-    # Capital Stake is the preferred genuine PSX source for this app because
-    # it is an authorized PSX vendor and exposes exchange-derived intraday bars.
-    if CAPITAL_STAKE_API_TOKEN and interval in {"1h", "5h", "5m", "15m"}:
-        try:
-            # 5m is used as the primitive bar for exact 1h aggregation.
-            df=fetch_capital_stake_psx_intraday(symbol, "5m", lookback_days=7)
-            df.attrs["source"]="Capital Stake / PSX licensed feed"; df.attrs["source_interval"]="5m"
-            return df
-        except Exception as exc:
-            errors.append(f"Capital Stake: {exc}")
 
-    # Twelve Data has explicit PSX/XKAR coverage and supports genuine 1h
-    # time series. Use it before Yahoo when configured.
-    if TWELVE_DATA_API_KEY and interval in {"1h","5h","15m","5m","1m"}:
-        try:
-            td_interval = "1h" if interval == "5h" else interval
-            df = fetch_twelve_data_psx_intraday(symbol, td_interval, outputsize=5000)
-            if interval == "5h":
-                df = _group_intraday_hours(df, 5)
-                df.attrs["source"] = "Twelve Data / XKAR"; df.attrs["source_interval"] = "5h"
-            return df
-        except Exception as exc:
-            errors.append(f"Twelve Data: {exc}")
-
-    yahoo_interval = "60m" if interval in {"1h","5h"} else interval
-    try:
-        response = _http_session.get(
-            YAHOO_CHART_URL.format(symbol=symbol),
-            params={"range": period, "interval": yahoo_interval, "events": "div,splits", "includeAdjustedClose": "false"},
-            headers={**HEADERS, "Accept": "application/json,text/plain,*/*"}, timeout=20,
-        )
-        response.raise_for_status()
-        payload=response.json(); chart=payload.get("chart") or {}
-        if chart.get("error"):
-            raise RuntimeError(str(chart["error"].get("description") or chart["error"]))
-        result=(chart.get("result") or [None])[0]
-        if not result: raise RuntimeError("Yahoo Chart returned no result")
-        ts=result.get("timestamp") or []
-        quote=((result.get("indicators") or {}).get("quote") or [None])[0] or {}
-        if not ts or not quote: raise RuntimeError("Yahoo Chart returned no intraday OHLCV")
-        df=pd.DataFrame({"date":pd.to_datetime(ts,unit="s",utc=True).tz_convert(None),
-                         "open":quote.get("open",[]),"high":quote.get("high",[]),
-                         "low":quote.get("low",[]),"close":quote.get("close",[]),"volume":quote.get("volume",[])})
-        for c in ("open","high","low","close","volume"): df[c]=pd.to_numeric(df[c],errors="coerce")
-        df=_sanitize_ohlcv(df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
-        if len(df)>=5: return df
-        errors.append(f"Yahoo Chart returned only {len(df)} valid candles")
-    except Exception as exc:
-        errors.append(f"Yahoo Chart: {exc}")
-
-    # yfinance is another client for the same Yahoo source, so it is a client
-    # fallback rather than a second data vendor.
-    try:
-        import yfinance as yf
-        df=yf.download(f"{symbol}.KA", interval=yahoo_interval, period=period, progress=False, auto_adjust=False, threads=False)
-        if df is not None and not df.empty:
-            if isinstance(df.columns,pd.MultiIndex): df.columns=[c[0] if isinstance(c,tuple) else c for c in df.columns]
-            df=df.reset_index(); first=df.columns[0]
-            df=df.rename(columns={first:"date","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
-            for c in ("open","high","low","close","volume"):
-                if c not in df.columns: df[c]=None
-                df[c]=pd.to_numeric(df[c],errors="coerce")
-            df["date"]=pd.to_datetime(df["date"],errors="coerce",utc=True).dt.tz_convert(None)
-            df=_sanitize_ohlcv(df.dropna(subset=["date","close"]).sort_values("date").drop_duplicates("date").reset_index(drop=True))
-            if len(df)>=5:
-                df.attrs["source"]="Yahoo Finance via yfinance"; df.attrs["source_interval"]=interval if interval not in {"1h","5h"} else "1h"
-                return df
-            errors.append(f"yfinance returned only {len(df)} valid candles")
-        else: errors.append("yfinance returned no data")
-    except Exception as exc:
-        errors.append(f"yfinance: {exc}")
-    raise RuntimeError("; ".join(errors[-4:]))
+def fetch_real_chart_history(symbol, cfg):
+    if cfg.get("mode") == "intraday":
+        # First try Yahoo's genuine .KA hourly history.  The official PSX
+        # timeseries endpoint is price-only in some deployments and therefore
+        # cannot safely be used to construct OHLCV candles.
+        return fetch_yahoo_psx_intraday(symbol, cfg["interval"], cfg["period"])
+    return get_full_history_cached(symbol)
 
 
 def fetch_yahoo_psx_history(symbol, period="max"):
@@ -5456,36 +4895,39 @@ def fetch_psx_history_direct(symbol, max_retries=2, retry_delays=(1, 2)):
     raise RuntimeError(f"No real historical OHLCV available for {symbol}. Providers tried: {' | '.join(errors[-4:])}")
 
 def compute_multi_timeframe_divergence(full_df, daily_df):
-    """Compute independent 1D/1W/1M divergence + local structure.
-
-    Each timeframe is analysed on its own bars. A valid divergence is no
-    longer hidden by a later non-divergent pivot, and structure is evaluated
-    on the same timeframe rather than borrowing the latest daily structure.
-    """
+    """Independently checks for RSI divergence on daily, weekly and
+    monthly resampled bars. full_df should hold as much history as is
+    available (used for weekly/monthly, where you need years of bars to
+    get enough pivots); daily_df is the already-windowed frame used for
+    the rest of the daily-bar screen, reused here for the "1D" column so
+    daily results stay consistent with the rest of the row."""
     out = {"div_1d": None, "div_1w": None, "div_1m": None}
+
     tf_specs = [
         ("div_1d", daily_df, None, PSX_DIVERGENCE_LOOKBACK_DAYS, PSX_DIVERGENCE_SWING_ORDER, PSX_DIVERGENCE_MIN_TRADING_DAYS),
-        ("div_1w", full_df, "W", 52, 4, 20),
-        ("div_1m", full_df, "M", 24, 3, 12),
+        ("div_1w", full_df, "W", 26, 3, 20),
+        ("div_1m", full_df, "M", 15, 2, 12),
     ]
+
     for key, src_df, rule, lookback, swing_order, min_bars in tf_specs:
         try:
             tf_df = src_df if rule is None else resample_ohlc(src_df, rule)
             if tf_df is None or len(tf_df) < min_bars:
                 continue
             tf_df = tf_df.copy()
-            tf_df["date"] = pd.to_datetime(tf_df["date"])
             tf_df["rsi"] = core.compute_rsi(tf_df["close"], core.RSI_PERIOD)
             lookback = min(lookback, len(tf_df) - 1)
             bullish = core.check_bullish_divergence(tf_df, lookback, swing_order)
             bearish = core.check_bearish_divergence(tf_df, lookback, swing_order)
-            structure = core.classify_structure(tf_df, min(len(tf_df), 60), max(3, swing_order))
-            hit = bullish or bearish
-            if hit:
-                out[key] = {"type": "bullish" if bullish else "bearish", **hit, "structure": structure or "mixed"}
+            if bullish:
+                out[key] = {"type": "bullish", **bullish}
+            elif bearish:
+                out[key] = {"type": "bearish", **bearish}
         except Exception:
-            pass
+            pass  # leave this timeframe's column blank rather than fail the whole row
+
     return out
+
 
 def _latest_heikin_ashi(df):
     """Return the latest true Heikin-Ashi OHLC values using the standard
@@ -5546,40 +4988,16 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
 
     multi_tf = compute_multi_timeframe_divergence(full_df, df)
 
-    # Daily divergence is retained for compatibility, but the personalized
-    # setup now uses the RSI zone and structure from the SAME timeframe that
-    # produced the divergence. This fixes the old bug where a weekly/monthly
-    # divergence was discarded because the daily RSI/divergence was blank.
-    bullish = multi_tf.get("div_1d") if multi_tf.get("div_1d", {}).get("type") == "bullish" else None
-    bearish = multi_tf.get("div_1d") if multi_tf.get("div_1d", {}).get("type") == "bearish" else None
+    # Personalized RSI zones + Heikin-Ashi confirmation. These are explicit
+    # filters, not relabelled daily data.
     ha = _latest_heikin_ashi(df)
     ha_color = ha["color"] if ha else "—"
-
-    bullish_tf_hits = [multi_tf[k] for k in ("div_1d", "div_1w", "div_1m") if multi_tf.get(k) and multi_tf[k].get("type") == "bullish"]
-    bearish_tf_hits = [multi_tf[k] for k in ("div_1d", "div_1w", "div_1m") if multi_tf.get(k) and multi_tf[k].get("type") == "bearish"]
-    bullish_divergence_any_tf = bool(bullish_tf_hits)
-    bearish_divergence_any_tf = bool(bearish_tf_hits)
-
-    def tf_setup_ok(hit, direction):
-        if not hit:
-            return False
-        rsi = hit.get("pivot2_rsi")
-        structure = hit.get("structure")
-        if rsi is None:
-            return False
-        if direction == "bullish":
-            return float(rsi) <= 50 and structure == "downtrend"
-        return float(rsi) >= 70 and structure == "uptrend"
-
-    bullish_setup = bool(is_near_low and any(tf_setup_ok(hit, "bullish") for hit in bullish_tf_hits) and ha_color == "green")
-    bearish_setup = bool(any(tf_setup_ok(hit, "bearish") for hit in bearish_tf_hits) and ha_color == "red")
-    structure = next((h.get("structure") for h in bullish_tf_hits + bearish_tf_hits if h.get("structure")), None) or core.classify_structure(df, PSX_STRUCTURE_LOOKBACK_DAYS, PSX_STRUCTURE_SWING_ORDER) or "mixed"
-
-    bullish_pivot = next((h for h in bullish_tf_hits if h.get("pivot2_rsi") is not None), None)
-    bearish_pivot = next((h for h in bearish_tf_hits if h.get("pivot2_rsi") is not None), None)
-
+    bullish = core.check_bullish_divergence(df, PSX_DIVERGENCE_LOOKBACK_DAYS, PSX_DIVERGENCE_SWING_ORDER)
+    bearish = core.check_bearish_divergence(df, PSX_DIVERGENCE_LOOKBACK_DAYS, PSX_DIVERGENCE_SWING_ORDER)
     def _tf_label(tf):
-        return (tf.get("type", "").capitalize() if tf else "—")
+        return (tf["type"].capitalize() if tf else "—")
+
+    structure = core.classify_structure(df, PSX_STRUCTURE_LOOKBACK_DAYS, PSX_STRUCTURE_SWING_ORDER)
 
     base_info = {
         "symbol": symbol,
@@ -5587,24 +5005,20 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
         "week52_low": round(float(low_52w), 2),
         "pct_above_52w_low": round(float(pct_above_low), 2),
         "latest_rsi": round(float(df["rsi"].iloc[-1]), 1),
-        "volume": float(df["volume"].iloc[-1]) if "volume" in df.columns and pd.notna(df["volume"].iloc[-1]) else None,
         "div_1d": _tf_label(multi_tf["div_1d"]),
         "div_1w": _tf_label(multi_tf["div_1w"]),
         "div_1m": _tf_label(multi_tf["div_1m"]),
         "structure": structure or "—",
-        "bullish_rsi_30": bool(bullish_pivot and float(bullish_pivot.get("pivot2_rsi")) <= 30),
-        "bullish_rsi_50": bool(bullish_pivot and float(bullish_pivot.get("pivot2_rsi")) <= 50),
-        "bearish_rsi_70": bool(bearish_pivot and float(bearish_pivot.get("pivot2_rsi")) >= 70),
-        "bearish_rsi_90": bool(bearish_pivot and float(bearish_pivot.get("pivot2_rsi")) >= 90),
+        "bullish_rsi_30": bool(bullish and bullish.get("pivot2_rsi") is not None and bullish.get("pivot2_rsi") <= 30),
+        "bullish_rsi_50": bool(bullish and bullish.get("pivot2_rsi") is not None and bullish.get("pivot2_rsi") <= 50),
+        "bearish_rsi_70": bool(bearish and bearish.get("pivot2_rsi") is not None and bearish.get("pivot2_rsi") >= 70),
+        "bearish_rsi_90": bool(bearish and bearish.get("pivot2_rsi") is not None and bearish.get("pivot2_rsi") >= 90),
         "ha_color": ha_color,
         "ha_bullish_confirmation": bool(ha_color == "green"),
         "ha_bearish_confirmation": bool(ha_color == "red"),
-        "bullish_pivot2_rsi": bullish_pivot.get("pivot2_rsi") if bullish_pivot else None,
-        "bearish_pivot2_rsi": bearish_pivot.get("pivot2_rsi") if bearish_pivot else None,
-        "bullish_setup": bullish_setup,
-        "bearish_setup": bearish_setup,
-        "personalized_match": bullish_setup or bearish_setup,
-        "personalized_setup": "bullish_reversal" if bullish_setup else ("bearish_reversal" if bearish_setup else None),
+        "bullish_pivot2_rsi": bullish.get("pivot2_rsi") if bullish else None,
+        "bearish_pivot2_rsi": bearish.get("pivot2_rsi") if bearish else None,
+        "personalized_match": bool(is_near_low or bullish or bearish or multi_tf["div_1w"] or multi_tf["div_1m"]),
     }
 
     return {
@@ -5613,9 +5027,6 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
         "is_near_low": is_near_low,
         "bullish": bullish,
         "bearish": bearish,
-        "multi_tf": multi_tf,
-        "bullish_tf_hits": bullish_tf_hits,
-        "bearish_tf_hits": bearish_tf_hits,
         "structure": structure,
     }
 
@@ -5623,14 +5034,8 @@ def _analyze_one_psx_divergence_symbol(symbol, start_date):
 # PSX throttles repeated historical POSTs fairly aggressively. Four workers
 # keeps the scan materially faster than serial requests without creating the
 # burst of simultaneous connections that caused the original timeout failures.
-PSX_DIVERGENCE_SCAN_WORKERS = max(2, min(4, int(os.environ.get("PSX_DIVERGENCE_SCAN_WORKERS", "4"))))
+PSX_DIVERGENCE_SCAN_WORKERS = 8
 PSX_DIVERGENCE_HISTORY_CACHE_HOURS = 24
-PSX_DIVERGENCE_BATCH_SIZE = max(50, min(90, int(os.environ.get("PSX_DIVERGENCE_BATCH_SIZE", "75"))))
-PSX_DIVERGENCE_BATCH_WORKERS = max(1, min(2, int(os.environ.get("PSX_DIVERGENCE_BATCH_WORKERS", "2"))))
-PSX_DIVERGENCE_JOB_MAX_SECONDS = 45 * 60
-PSX_DIVERGENCE_JOB_DIR = BASE / ".psx_divergence_jobs"
-PSX_DIVERGENCE_JOB_DIR.mkdir(parents=True, exist_ok=True)
-_psx_divergence_spawn_lock = threading.Lock()
 _psx_divergence_history_cache = {}
 _psx_divergence_history_cache_lock = threading.Lock()
 
@@ -5673,7 +5078,7 @@ def _normalize_yahoo_batch_frame(frame, ticker):
         return None
 
 
-def _prefetch_psx_histories_batch(symbols, period="5y", batch_size=75, max_workers=2):
+def _prefetch_psx_histories_batch(symbols, period="5y", batch_size=50, max_workers=3):
     """Warm the in-process PSX history cache with batched Yahoo .KA downloads.
 
     A market-wide divergence/technical scan should not issue one HTTP request
@@ -5718,8 +5123,7 @@ def _prefetch_psx_histories_batch(symbols, period="5y", batch_size=75, max_worke
                 group_by="ticker",
                 auto_adjust=False,
                 progress=False,
-                threads=False,
-                timeout=10,
+                threads=True,
             )
         except Exception:
             return 0
@@ -5729,6 +5133,9 @@ def _prefetch_psx_histories_batch(symbols, period="5y", batch_size=75, max_worke
             if df is not None and len(df) >= 20:
                 with _psx_divergence_history_cache_lock:
                     _psx_divergence_history_cache[sym] = {"df": df, "time": datetime.now()}
+                # Share the same warmed history with the stock-detail cache.
+                with _stock_history_cache_lock:
+                    _stock_history_cache[sym] = {"df": df, "time": datetime.now()}
                 stored += 1
         return stored
 
@@ -5774,14 +5181,14 @@ def fetch_psx_scraper_universe():
         if any(x in typ for x in ("debt","bond","sukuk","etf")): continue
         seen.add(symbol); out.append({"symbol":symbol,"company":str(row.get("name") or row.get("company") or row.get("company_name") or symbol),"sector":str(row.get("sector") or row.get("sector_name") or "")})
     out.sort(key=lambda x:x["symbol"])
-    if len(out)<MIN_COMPLETE_PSX_SYMBOLS: raise RuntimeError(f"PSX scraper returned only {len(out)} symbols")
+    if len(out)<100: raise RuntimeError(f"PSX scraper returned only {len(out)} symbols")
     return out
 
 
 def get_symbols_for_full_scan():
     try:
         items=fetch_psx_symbols(force=True)
-        if len(items)>=MIN_COMPLETE_PSX_SYMBOLS: return items
+        if len(items)>=100: return items
     except Exception: pass
     try:
         items=fetch_psx_scraper_universe()
@@ -5812,24 +5219,19 @@ def run_psx_divergence_scan(progress_cb=None):
     # it must never fall back to the 10 development symbols.
     tickers_meta = get_symbols_for_full_scan()
     tickers = [s["symbol"] for s in tickers_meta]
-    total = len(tickers)
     if not tickers:
         raise RuntimeError("PSX did not return a symbol list.")
 
     # Warm as much of the full universe as possible in a handful of batched
     # requests before falling back to per-symbol providers. This is the main
-    # performance fix for the 555+ symbol market-wide scan. Progress is
-    # reported using the real universe size, so the browser never sits on a
-    # misleading 0/0 state during the warm-up phase.
-    scan_started_epoch = time.time()
-    scan_started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    # performance fix for the 555+ symbol market-wide scan.
     prefetch_started = time.time()
     if progress_cb:
-        progress_cb(0, total, f"Preparing batched PSX history for {total} symbols…")
-    prefetched = _prefetch_psx_histories_batch(tickers, period="5y", batch_size=PSX_DIVERGENCE_BATCH_SIZE, max_workers=PSX_DIVERGENCE_BATCH_WORKERS)
+        progress_cb(0, total, "Preparing batched PSX history…")
+    prefetched = _prefetch_psx_histories_batch(tickers, period="5y", batch_size=50, max_workers=3)
     prefetch_seconds = round(time.time() - prefetch_started, 2)
     if progress_cb:
-        progress_cb(min(prefetched, total), total, f"History cache warmed for {prefetched}/{total} symbols")
+        progress_cb(0, total, f"History cache warmed for {prefetched}/{total} symbols")
 
     start_date = date.today() - timedelta(days=PSX_DIVERGENCE_HISTORY_DAYS)
 
@@ -5838,9 +5240,8 @@ def run_psx_divergence_scan(progress_cb=None):
     uptrend_hits, downtrend_hits = [], []
     personalized_hits = []
     errors = []
-    skipped = 0
-    usable = 0
 
+    total = len(tickers)
     done = 0
     done_lock = threading.Lock()
 
@@ -5859,10 +5260,8 @@ def run_psx_divergence_scan(progress_cb=None):
                 errors.append({"symbol": result["symbol"], "error": result["error"]})
                 continue
             if result.get("skip"):
-                skipped += 1
                 continue
 
-            usable += 1
             base_info = result["base_info"]
             bullish, bearish, structure = result["bullish"], result["bearish"], result["structure"]
             if base_info.get("personalized_match"):
@@ -5870,23 +5269,27 @@ def run_psx_divergence_scan(progress_cb=None):
 
             if result["is_near_low"]:
                 near_low_hits.append(dict(base_info))
-            if result["is_near_low"] and result.get("bullish_tf_hits"):
-                first_bull = result["bullish_tf_hits"][0]
-                hit = dict(base_info); hit.update(first_bull); hit["timeframe"] = next((k.replace("div_", "").upper() for k in ("div_1d", "div_1w", "div_1m") if result.get("multi_tf", {}).get(k) == first_bull), "")
+            if result["is_near_low"] and bullish:
+                hit = dict(base_info); hit.update(bullish)
                 divergence_hits.append(hit)
-            for tf_key in ("div_1d", "div_1w", "div_1m"):
-                tf_hit = result.get("multi_tf", {}).get(tf_key)
-                if not tf_hit:
-                    continue
-                hit = dict(base_info); hit.update(tf_hit); hit["timeframe"] = tf_key.replace("div_", "").upper()
-                if tf_hit.get("type") == "bullish":
-                    bullish_all_hits.append(hit)
-                    if tf_hit.get("structure") == "uptrend": uptrend_hits.append(dict(hit, divergence_type="bullish"))
-                    if tf_hit.get("structure") == "downtrend": downtrend_hits.append(dict(hit, divergence_type="bullish"))
-                else:
-                    bearish_all_hits.append(hit)
-                    if tf_hit.get("structure") == "uptrend": uptrend_hits.append(dict(hit, divergence_type="bearish"))
-                    if tf_hit.get("structure") == "downtrend": downtrend_hits.append(dict(hit, divergence_type="bearish"))
+            if bullish:
+                hit = dict(base_info); hit.update(bullish)
+                bullish_all_hits.append(hit)
+            if bearish:
+                hit = dict(base_info); hit.update(bearish)
+                bearish_all_hits.append(hit)
+            if bullish and structure == "uptrend":
+                hit = dict(base_info); hit["divergence_type"] = "bullish"; hit.update(bullish)
+                uptrend_hits.append(hit)
+            if bearish and structure == "uptrend":
+                hit = dict(base_info); hit["divergence_type"] = "bearish"; hit.update(bearish)
+                uptrend_hits.append(hit)
+            if bullish and structure == "downtrend":
+                hit = dict(base_info); hit["divergence_type"] = "bullish"; hit.update(bullish)
+                downtrend_hits.append(hit)
+            if bearish and structure == "downtrend":
+                hit = dict(base_info); hit["divergence_type"] = "bearish"; hit.update(bearish)
+                downtrend_hits.append(hit)
 
     def sort_hits(hits, key="pct_above_52w_low"):
         return sorted(hits, key=lambda h: h.get(key, 0))
@@ -5902,129 +5305,25 @@ def run_psx_divergence_scan(progress_cb=None):
         "errors": errors,
         "symbols_scanned": total,
         "universe_count": total,
-        "symbols_with_data": usable,
-        "symbols_skipped_insufficient_history": skipped,
+        "symbols_with_data": total - len(errors),
         "symbols_failed": len(errors),
         "history_prefetched": prefetched,
         "history_prefetch_seconds": prefetch_seconds,
         "scan_complete": True,
-        "scan_started_at": scan_started_at,
-        "scan_completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "scan_duration_seconds": round(time.time() - scan_started_epoch, 2),
     }
 
 
-def _psx_job_path(job_id):
-    return PSX_DIVERGENCE_JOB_DIR / f"{job_id}.json"
-
-def _psx_write_job(job_id, payload):
-    path = _psx_job_path(job_id)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(_clean_for_json(payload), separators=(",", ":")), encoding="utf-8")
-    os.replace(tmp, path)
-
-def _psx_read_job(job_id):
-    try:
-        return json.loads(_psx_job_path(job_id).read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-def _psx_mark_job_error_if_dead(job):
-    if not job or job.get("status") != "running":
-        return job
-    pid = int(job.get("pid") or 0)
-    started = float(job.get("started_epoch") or 0)
-    alive = False
-    if pid > 0:
-        try:
-            os.kill(pid, 0)
-            alive = True
-        except OSError:
-            alive = False
-    if alive and started and time.time() - started > PSX_DIVERGENCE_JOB_MAX_SECONDS:
-        alive = False
-    if not alive:
-        job = dict(job)
-        job.update({"status": "error", "error": "Scan worker stopped before completing. Start a new scan."})
-        _psx_write_job(job["job_id"], job)
-    return job
-
-def _psx_latest_running_job():
-    now = time.time()
-    for path in sorted(PSX_DIVERGENCE_JOB_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
-        job = _psx_read_job(path.stem)
-        if not job or job.get("status") != "running":
-            continue
-        job = _psx_mark_job_error_if_dead(job)
-        if job.get("status") == "running" and now - float(job.get("started_epoch", now)) < PSX_DIVERGENCE_JOB_MAX_SECONDS:
-            return job
-    return None
-
-def _psx_persistent_result():
-    try:
-        conn = db()
-        row = conn.execute("SELECT result_json, saved_at FROM screener_results WHERE cache_key=?", ("psxdivergence_latest",)).fetchone()
-        conn.close()
-        if row:
-            return {"result": json.loads(row["result_json"]), "saved_at": row["saved_at"]}
-    except Exception:
-        pass
-    path = PSX_DIVERGENCE_JOB_DIR / "latest_result.json"
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-def _psx_save_persistent_result(result):
-    saved_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    clean = _clean_for_json(result)
-    try:
-        conn = db()
-        conn.execute(
-            "INSERT INTO screener_results(cache_key,screener_name,criteria_json,result_json,saved_at) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json,saved_at=excluded.saved_at",
-            ("psxdivergence_latest", "PSX Divergence Screener", "{}", json.dumps(clean, separators=(",", ":")), saved_at),
-        )
-        conn.commit(); conn.close()
-    except Exception:
-        pass
-    path = PSX_DIVERGENCE_JOB_DIR / "latest_result.json"
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"result": clean, "saved_at": saved_at}, separators=(",", ":")), encoding="utf-8")
-    os.replace(tmp, path)
-
-def _spawn_psx_divergence_worker(job_id):
-    worker_script = BASE / "psx_divergence_worker.py"
-    env = os.environ.copy()
-    env["PSX_SCAN_JOB_ID"] = job_id
-    env["PYTHONUNBUFFERED"] = "1"
-    return subprocess.Popen(
-        [sys.executable, str(worker_script)],
-        cwd=str(BASE),
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
-
 def _run_psx_divergence_job_in_background(job_id):
-    # Run the expensive scan OUTSIDE the Gunicorn worker. A single Render
-    # web worker must stay responsive to /scan/status while Yahoo/PSX I/O and
-    # pandas calculations run. The old in-process thread could starve/crash
-    # the Gunicorn worker and make Render return an HTML 502 to the browser.
-    with _psx_divergence_spawn_lock:
-        running = _psx_latest_running_job()
-        if running and running.get("job_id") != job_id:
-            return running.get("pid")
-        proc = _spawn_psx_divergence_worker(job_id)
-        job = _psx_read_job(job_id) or {}
-        job.update({"job_id": job_id, "pid": proc.pid, "status": "running",
-                    "started_epoch": time.time(), "progress": {"done": 0, "total": 0, "symbol": ""},
-                    "result": None, "error": None})
-        _psx_write_job(job_id, job)
-        return proc.pid
+    def worker():
+        try:
+            def progress_cb(done, tot, sym):
+                _update_tech_job(job_id, progress={"done": done, "total": tot, "symbol": sym})
+            result = run_psx_divergence_scan(progress_cb=progress_cb)
+            _save_tech_cache("psxdivergence", result)
+            _update_tech_job(job_id, status="done", result=result)
+        except Exception as e:
+            _update_tech_job(job_id, status="error", error=str(e))
+    threading.Thread(target=worker, daemon=True).start()
 
 
 @app.get("/api/psxdivergence/scan/start")
@@ -6033,23 +5332,17 @@ def api_psx_divergence_scan_start():
     if guard:
         return guard
     try:
+        # Show the most recent full-market result immediately when one exists,
+        # while a fresh scan runs in the background. This prevents the UI from
+        # appearing frozen for several minutes on a Render free-tier wake-up.
         cached = _load_tech_cache("psxdivergence")
-        persistent = _psx_persistent_result()
-        running = _psx_latest_running_job()
-        if running:
-            payload = {"ok": True, "job_id": running["job_id"], "message": "A full PSX scan is already running."}
-        else:
-            job_id = str(uuid.uuid4())
-            _psx_write_job(job_id, {"job_id": job_id, "status": "starting", "pid": 0, "started_epoch": time.time(),
-                                    "progress": {"done": 0, "total": 0, "symbol": ""}, "result": None, "error": None})
-            _run_psx_divergence_job_in_background(job_id)
-            payload = {"ok": True, "job_id": job_id, "message": "Full PSX scan started in a separate worker."}
+        job_id = _new_tech_job()
+        _run_psx_divergence_job_in_background(job_id)
+        payload = {"ok": True, "job_id": job_id, "message": "Market-wide PSX scan started."}
         if cached and cached.get("data"):
             payload["cached_result"] = cached["data"]
             payload["cached_saved_at"] = cached.get("saved_at")
-        elif persistent:
-            payload["cached_result"] = persistent.get("result", persistent)
-            payload["cached_saved_at"] = persistent.get("saved_at")
+            payload["message"] = "Showing the last full-market scan immediately while a fresh scan runs in the background."
         response = safe_jsonify(payload)
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return response
@@ -6061,18 +5354,11 @@ def api_psx_divergence_scan_start():
 
 @app.get("/api/psxdivergence/scan/status/<job_id>")
 def api_psx_divergence_scan_status(job_id):
-    # Status is deliberately file-backed and tiny. It remains available even
-    # if the expensive scan worker is using lots of CPU/memory or Gunicorn has
-    # restarted since the scan began. Never proxy the full scan through this
-    # endpoint.
-    job = _psx_read_job(job_id)
+    job = _get_tech_job(job_id)
     if job is None:
-        job = _get_tech_job(job_id)
-    if job is None:
-        response = safe_jsonify({"ok": False, "error": "Unknown job id. The scan worker may have been restarted."})
+        response = safe_jsonify({"ok": False, "error": "Unknown job id (server may have restarted)."})
         response.headers["Cache-Control"] = "no-store"
         return response, 404
-    job = _psx_mark_job_error_if_dead(job)
     response = safe_jsonify({"ok": True, **job})
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
@@ -6081,12 +5367,9 @@ def api_psx_divergence_scan_status(job_id):
 @app.get("/api/psxdivergence/scan/cached")
 def api_psx_divergence_scan_cached():
     cached = _load_tech_cache("psxdivergence")
-    if cached is not None:
-        return safe_jsonify({"ok": True, "found": True, "result": cached["data"], "saved_at": cached["saved_at"]})
-    persistent = _psx_persistent_result()
-    if persistent:
-        return safe_jsonify({"ok": True, "found": True, "result": persistent.get("result", persistent), "saved_at": persistent.get("saved_at")})
-    return safe_jsonify({"ok": True, "found": False})
+    if cached is None:
+        return safe_jsonify({"ok": True, "found": False})
+    return safe_jsonify({"ok": True, "found": True, "result": cached["data"], "saved_at": cached["saved_at"]})
 
 
 # =====================================================================
@@ -6360,47 +5643,36 @@ def stock_verdict(symbol):
 # toggles) is served from the already-fetched DataFrame.
 
 CHART_TIMEFRAME_CONFIG = {
-    # Each button is a CANDLE INTERVAL, not merely a display-window label.
-    # The backend retrieves the longest practical source history and then
-    # aggregates it to the requested bar size. This prevents the old bug
-    # where a daily candle was shown for every long timeframe.
-    "1H": {"kind": "intraday", "intraday_interval": "1h", "intraday_period": "730d", "display_days": 60, "label": "1H · 1h candles", "minimum_bars": 5},
-    "5H": {"kind": "intraday", "intraday_interval": "1h", "intraday_period": "730d", "aggregate_hours": 5, "display_days": 365, "label": "5H · 5h candles", "minimum_bars": 5},
-    "1D": {"kind": "daily", "display_days": 365 * 3, "label": "1D · 1d candles", "minimum_bars": 30},
-    "5D": {"kind": "daily", "trading_day_group": 5, "display_days": 365 * 10, "label": "5D · 5d candles", "minimum_bars": 20},
-    "1M": {"kind": "daily", "resample": "MS", "display_days": 365 * 15, "label": "1M · 1mo candles", "minimum_bars": 12},
-    "3M": {"kind": "daily", "resample": "3MS", "display_days": 365 * 15, "label": "3M · 3mo candles", "minimum_bars": 8},
-    "6M": {"kind": "daily", "resample": "6MS", "display_days": 365 * 15, "label": "6M · 6mo candles", "minimum_bars": 5},
-    "1Y": {"kind": "daily", "resample": "YS", "display_days": 365 * 15, "label": "1Y · 1y candles", "minimum_bars": 5},
-    "3Y": {"kind": "daily", "resample": "3YS", "display_days": 365 * 30, "label": "3Y · 3y candles", "minimum_bars": 3},
-    "5Y": {"kind": "daily", "resample": "5YS", "display_days": 365 * 40, "label": "5Y · 5y candles", "minimum_bars": 2},
-    "ALL": {"kind": "daily", "resample": None, "display_days": None, "label": "ALL · 1d candles", "minimum_bars": 30},
+    # Intraday intervals are NEVER synthesized from daily data.  They use a
+    # genuine hourly provider chain and return unavailable when real hourly
+    # history is not supplied by the upstream provider.
+    "1H": {"mode": "intraday", "interval": "60m", "period": "60d", "resample": None},
+    "5H": {"mode": "intraday", "interval": "60m", "period": "60d", "resample": "5h"},
+    # The label is the candle size, not the visible-window size.
+    "1D": {"mode": "daily", "years": 12, "resample": None},
+    "5D": {"mode": "daily", "years": 12, "resample": "5D"},
+    "1M": {"mode": "daily", "years": 15, "resample": "ME"},
+    "3M": {"mode": "daily", "years": 20, "resample": "QE"},
+    "6M": {"mode": "daily", "years": 20, "resample": "6ME"},
+    "1Y": {"mode": "daily", "years": 25, "resample": "YE"},
+    "3Y": {"mode": "daily", "years": 30, "resample": "3YE"},
+    "5Y": {"mode": "daily", "years": 35, "resample": "5YE"},
+    "ALL": {"mode": "daily", "years": None, "resample": None},
 }
-
 CHART_MIN_CANDLES = 5
 
 
-def _chart_time_value(d, intraday=False):
-    ts = pd.Timestamp(d)
-    if intraday:
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
-        else:
-            ts = ts.tz_convert("UTC")
-        return int(ts.timestamp())
-    return ts.date().isoformat()
-
-
-def _series_to_points(dates, series, intraday=False):
+def _series_to_points(dates, series):
     points = []
     for d, v in zip(dates, series):
         if pd.isna(v):
             continue
-        points.append({"time": _chart_time_value(d, intraday), "value": round(float(v), 4)})
+        t = d.date().isoformat() if hasattr(d, "date") else str(d)
+        points.append({"time": t, "value": round(float(v), 4)})
     return points
 
 
-def compute_chart_indicator_series(df, intraday=False):
+def compute_chart_indicator_series(df):
     """Full SMA/EMA(20/50/200), RSI(14) and MACD(12,26,9) series for
     whatever timeframe df represents — computed on that timeframe's own
     bars (so "SMA50" on a weekly chart is 50 weekly periods), which is
@@ -6411,31 +5683,31 @@ def compute_chart_indicator_series(df, intraday=False):
 
     for n in (20, 50, 200):
         sma = closes.rolling(n).mean()
-        out[f"sma{n}"] = _series_to_points(df["date"], sma, intraday)
+        out[f"sma{n}"] = _series_to_points(df["date"], sma)
         ema = closes.ewm(span=n, adjust=False).mean()
-        out[f"ema{n}"] = _series_to_points(df["date"], ema, intraday)
+        out[f"ema{n}"] = _series_to_points(df["date"], ema)
 
     rsi = core.compute_rsi(closes, 14)
-    out["rsi14"] = _series_to_points(df["date"], rsi, intraday)
+    out["rsi14"] = _series_to_points(df["date"], rsi)
 
     ema12 = closes.ewm(span=12, adjust=False).mean()
     ema26 = closes.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
     signal_line = macd_line.ewm(span=9, adjust=False).mean()
     hist = macd_line - signal_line
-    out["macd"] = _series_to_points(df["date"], macd_line, intraday)
-    out["macd_signal"] = _series_to_points(df["date"], signal_line, intraday)
-    out["macd_hist"] = _series_to_points(df["date"], hist, intraday)
+    out["macd"] = _series_to_points(df["date"], macd_line)
+    out["macd_signal"] = _series_to_points(df["date"], signal_line)
+    out["macd_hist"] = _series_to_points(df["date"], hist)
 
     return out
 
 
-def _ohlc_to_candles_and_volume(df, intraday=False):
+def _ohlc_to_candles_and_volume(df):
     candles, volume = [], []
     has_volume = "volume" in df.columns
     for row in df.itertuples(index=False):
         d = getattr(row, "date")
-        t = _chart_time_value(d, intraday)
+        t = d.date().isoformat() if hasattr(d, "date") else str(d)
         o, h, l, c = float(row.open), float(row.high), float(row.low), float(row.close)
         candles.append({"time": t, "open": round(o, 2), "high": round(h, 2), "low": round(l, 2), "close": round(c, 2)})
         if has_volume:
@@ -6448,66 +5720,6 @@ def _ohlc_to_candles_and_volume(df, intraday=False):
     return candles, volume
 
 
-def _group_ohlc_by_trading_days(df, days_per_candle=5):
-    """Aggregate daily PSX bars into N-trading-session candles, preserving
-    gaps such as weekends/holidays instead of treating calendar days as bars."""
-    if df is None or df.empty:
-        return df
-    d = df.sort_values("date").reset_index(drop=True).copy()
-    groups = (d.index // int(days_per_candle))
-    agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
-    if "volume" in d.columns:
-        agg["volume"] = "sum"
-    out = d.groupby(groups, sort=True).agg(agg).reset_index(drop=True)
-    # Use the last trading date in each group as the candle timestamp.
-    out["date"] = d.groupby(groups, sort=True)["date"].last().values
-    return out[["date", "open", "high", "low", "close", "volume"]]
-
-def _group_intraday_to_hour_bars(df):
-    """Aggregate genuine 5-minute exchange bars into genuine 1-hour OHLCV bars.
-    The resulting bars are exact OHLCV aggregates of source bars, never price
-    interpolation. Session boundaries are kept separate in PKT.
-    """
-    if df is None or df.empty: return df
-    d=df.sort_values("date").copy()
-    local=pd.to_datetime(d["date"],utc=True).dt.tz_convert("Asia/Karachi")
-    d["_session"]=local.dt.date.astype(str)
-    d["_bucket"]=local.dt.floor("h")
-    agg={"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-    out=d.groupby(["_session","_bucket"],sort=True).agg(agg).reset_index()
-    out["date"]=pd.to_datetime(out["_bucket"],utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
-    return out[["date","open","high","low","close","volume"]].sort_values("date").reset_index(drop=True)
-
-
-def _group_intraday_hours(df, hours_per_candle=5):
-    """Aggregate 1-hour candles into N-hour candles without combining two
-    separate PSX trading sessions. A normal PSX session therefore produces
-    one 5H candle, while a partial session remains a valid partial candle."""
-    if df is None or df.empty:
-        return df
-    d = df.sort_values("date").reset_index(drop=True).copy()
-    local = pd.to_datetime(d["date"], utc=True).dt.tz_convert("Asia/Karachi")
-    d["_session"] = local.dt.date.astype(str)
-    parts = []
-    for _, part in d.groupby("_session", sort=True):
-        part = part.reset_index(drop=True)
-        for start in range(0, len(part), int(hours_per_candle)):
-            chunk = part.iloc[start:start + int(hours_per_candle)]
-            if chunk.empty:
-                continue
-            row = {
-                "date": chunk["date"].iloc[-1],
-                "open": chunk["open"].iloc[0],
-                "high": chunk["high"].max(),
-                "low": chunk["low"].min(),
-                "close": chunk["close"].iloc[-1],
-                "volume": chunk["volume"].sum() if "volume" in chunk.columns else None,
-            }
-            parts.append(row)
-    return pd.DataFrame(parts, columns=["date", "open", "high", "low", "close", "volume"])
-
-
-
 @app.get("/api/stock/<symbol>/chart")
 def stock_chart(symbol):
     guard = _technicals_guard()
@@ -6515,85 +5727,59 @@ def stock_chart(symbol):
         return guard
 
     timeframe = request.args.get("timeframe", "1Y").upper()
-    cfg = dict(CHART_TIMEFRAME_CONFIG.get(timeframe, CHART_TIMEFRAME_CONFIG["1Y"]))
-    minimum = int(cfg.get("minimum_bars", CHART_MIN_CANDLES))
+    cfg = CHART_TIMEFRAME_CONFIG.get(timeframe, CHART_TIMEFRAME_CONFIG["1Y"])
 
     try:
-        if cfg.get("kind") == "intraday":
-            # Yahoo's 60m retention is limited, but it is the correct source
-            # for genuine hourly OHLCV. We request the maximum practical
-            # window and slice locally. No daily fallback is allowed because
-            # that would silently turn an hourly chart into a daily chart.
-            chart_df = fetch_yahoo_psx_intraday(symbol, "1h", cfg.get("intraday_period", "730d"))
-            chart_df = _sanitize_ohlcv(chart_df)
-            source_interval = chart_df.attrs.get("source_interval", "1h") if hasattr(chart_df, "attrs") else "1h"
-            if source_interval == "5m":
-                chart_df = _group_intraday_to_hour_bars(chart_df)
-            if cfg.get("aggregate_hours"):
-                chart_df = _group_intraday_hours(chart_df, cfg["aggregate_hours"])
-            else:
-                cutoff = chart_df["date"].max() - pd.Timedelta(days=int(cfg.get("display_days", 60)))
-                chart_df = chart_df[chart_df["date"] >= cutoff].copy()
-            chart_df = _sanitize_ohlcv(chart_df)
-            if len(chart_df) < minimum:
-                raise RuntimeError(f"Only {len(chart_df)} usable {cfg['label']} were returned by the hourly feed.")
-            candles, volume = _ohlc_to_candles_and_volume(chart_df, intraday=True)
-            indicators = compute_chart_indicator_series(chart_df, intraday=True)
-            basis = chart_df.iloc[-1]
-            return safe_jsonify({
-                "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
-                "candle_interval": "5h" if cfg.get("aggregate_hours") else "1h",
-                "data_source": str(chart_df.attrs.get("source") or "Genuine intraday OHLCV provider"),
-                "history_span": f"{len(chart_df)} candles",
-                "candles": candles, "volume": volume, "indicators": indicators,
-                "pivot_points": {\
-                    "classic": compute_pivot_points(float(basis["high"]), float(basis["low"]), float(basis["close"])),
-                    "fibonacci": compute_fibonacci_pivot_points(float(basis["high"]), float(basis["low"]), float(basis["close"])),
-                    "basis_date": pd.Timestamp(basis["date"]).date().isoformat(),
-                },
-            })
-
-        full_df = get_full_history_cached(symbol)
-        if full_df is None or full_df.empty:
-            raise RuntimeError("No daily PSX history is available for this symbol.")
-        full_df = _sanitize_ohlcv(full_df.sort_values("date").reset_index(drop=True))
-        if cfg.get("display_days") is not None:
-            cutoff = full_df["date"].max() - pd.Timedelta(days=int(cfg["display_days"]))
-            windowed = full_df[full_df["date"] >= cutoff].copy()
-        else:
-            windowed = full_df.copy()
-
-        if timeframe == "5D":
-            chart_df = _group_ohlc_by_trading_days(windowed, 5)
-        elif cfg.get("resample"):
-            chart_df = resample_ohlc(windowed, cfg["resample"])
-        else:
-            chart_df = windowed
-        chart_df = _sanitize_ohlcv(chart_df)
-        if len(chart_df) < minimum:
-            raise RuntimeError(f"Only {len(chart_df)} usable {cfg['label']} were returned by the available PSX history.")
-
-        candles, volume = _ohlc_to_candles_and_volume(chart_df, intraday=False)
-        indicators = compute_chart_indicator_series(chart_df, intraday=False)
-        completed = chart_df[chart_df["date"].dt.date < date.today()]
-        basis = completed.iloc[-1] if not completed.empty else chart_df.iloc[-1]
-        return safe_jsonify({
-            "available": True, "symbol": symbol.upper(), "timeframe": timeframe,
-            "candle_interval": cfg["label"].split("·", 1)[-1].strip().replace(" candles", ""),
-            "data_source": "PSX-compatible historical OHLCV provider chain",
-            "history_span": f"{len(chart_df)} candles",
-            "candles": candles, "volume": volume, "indicators": indicators,
-            "pivot_points": {
-                "classic": compute_pivot_points(float(basis["high"]), float(basis["low"]), float(basis["close"])),
-                "fibonacci": compute_fibonacci_pivot_points(float(basis["high"]), float(basis["low"]), float(basis["close"])),
-                "basis_date": pd.Timestamp(basis["date"]).date().isoformat(),
-            },
-        })
+        full_df = fetch_real_chart_history(symbol, cfg)
     except Exception as e:
-        return safe_jsonify({
-            "available": False, "symbol": symbol.upper(), "timeframe": timeframe,
-            "note": f"Could not load genuine {cfg.get('label', timeframe)}: {e}",
-        })
+        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": f"Real {timeframe} candles are unavailable from the supported provider chain: {e}"})
+
+    if full_df is None or full_df.empty:
+        return safe_jsonify({"available": False, "symbol": symbol.upper(), "timeframe": timeframe, "note": "No real OHLCV history is available for this timeframe."})
+
+    full_df = full_df.sort_values("date").reset_index(drop=True)
+
+    # Pivot levels always use the latest completed real bar from the same
+    # source. For intraday, use the latest completed hourly bar.
+    completed = full_df[full_df["date"] < pd.Timestamp.now().floor("h")]
+    pivot_row = completed.iloc[-1] if not completed.empty else full_df.iloc[-1]
+    pivot_high = float(pivot_row["high"]) if pd.notna(pivot_row["high"]) else float(pivot_row["close"])
+    pivot_low = float(pivot_row["low"]) if pd.notna(pivot_row["low"]) else float(pivot_row["close"])
+    pivot_close = float(pivot_row["close"])
+
+    windowed = full_df
+    if cfg.get("mode") == "daily" and cfg.get("years") is not None:
+        cutoff = full_df["date"].iloc[-1] - pd.Timedelta(days=365.25 * cfg["years"])
+        windowed = full_df[full_df["date"] >= cutoff].reset_index(drop=True)
+
+    chart_df = resample_ohlc(windowed, cfg["resample"]) if cfg.get("resample") else windowed
+
+    if chart_df is None or chart_df.empty or len(chart_df) < CHART_MIN_CANDLES:
+        return safe_jsonify({"available": False, "symbol": symbol.upper(), "note": "Not enough price history for this timeframe yet."})
+
+    chart_df = _sanitize_ohlcv(chart_df)
+    candles, volume = _ohlc_to_candles_and_volume(chart_df)
+    indicators = compute_chart_indicator_series(chart_df)
+
+    return safe_jsonify({
+        "available": True,
+        "symbol": symbol.upper(),
+        "timeframe": timeframe,
+        "data_source": "Genuine PSX-compatible OHLCV provider chain; intraday uses real hourly bars only and never daily-to-hourly fabrication",
+        "candles": candles,
+        "volume": volume,
+        "indicators": indicators,
+        "pivot_points": {
+            "classic": compute_pivot_points(pivot_high, pivot_low, pivot_close),
+            "fibonacci": compute_fibonacci_pivot_points(pivot_high, pivot_low, pivot_close),
+            "basis_date": pivot_row["date"].date().isoformat() if pd.notna(pivot_row["date"]) else None,
+        },
+    })
+
+
+# =====================================================================
+# PORTFOLIO CSV IMPORT / EXPORT (merged in from the PSX Toolkit)
+# =====================================================================
 
 @app.get("/api/portfolio/export")
 def portfolio_export_csv():

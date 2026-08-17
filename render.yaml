@@ -4,12 +4,8 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --keep-alive 5
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 120 --keep-alive 5
     healthCheckPath: /healthz
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.8
-
-# Set these in Render Environment, not in source control:
-# CAPITAL_STAKE_API_TOKEN=<licensed Capital Stake token>
-# TWELVE_DATA_API_KEY=<optional Twelve Data key with XKAR coverage>

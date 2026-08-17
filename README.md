@@ -209,24 +209,3 @@ now included as its own tab (Divergence Screener), separate from PSX
 ## Verification
 
 See `VERIFICATION.md` for the fixes, regression checks, and the exact live Render/PSX checks still required after deployment. The included `tests/test_math.py` and `tests/test_frontend_static.py` cover the calculation and UI-wiring regressions.
-
-
-## V10 update
-See `V10_FIX_NOTES.md` for the corrected 1H/5H/1D/5D chart ranges, PSX closed-market ticker status, Insider Transactions research section, source-backed EPS/dividend/volume fields, and divergence volume columns.
-
-
-## V13 genuine PSX intraday data
-
-The chart never fabricates 1H/5H candles. It uses a strict provider chain:
-1. Capital Stake licensed PSX feed (`CAPITAL_STAKE_API_TOKEN`) using genuine 5-minute exchange-derived bars, aggregated exactly into 1-hour/5-hour OHLCV where needed.
-2. Twelve Data XKAR coverage (`TWELVE_DATA_API_KEY`) for genuine 1-hour PSX time series when configured.
-3. Yahoo Finance genuine intraday history as a public fallback.
-
-If no provider returns genuine intraday OHLCV, the API returns an unavailable state instead of substituting daily candles. Capital Stake is an authorized PSX data vendor; its public documentation lists 1m/5m/15m intraday PSX bars and licensed API authentication.
-
-Recommended Render environment variables for genuine PSX intraday/fundamental coverage:
-- `CAPITAL_STAKE_API_TOKEN` — licensed Capital Stake API token.
-- `TWELVE_DATA_API_KEY` — optional Twelve Data key; its exchange catalog includes Pakistan Stock Exchange (XKAR).
-- `CAPITAL_STAKE_CHART_ENDPOINT` — optional override if Capital Stake provides a different chart endpoint on your plan (default `/market/chart`).
-
-V13 also adds `/api/screener/stock-verdict/<SYMBOL>` for a one-stock audit of the live technical screener and the personalized RSI-divergence setup.

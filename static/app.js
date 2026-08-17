@@ -123,7 +123,6 @@ const pageMeta = {
   macro: ["Pakistan Macro", "Key economic indicators"],
   news: ["News", "Company and market updates"],
   announcements: ["Announcements", "All PSX company announcements and notices"],
-  insider: ["Insider Transactions", "PSX director, executive and substantial-shareholder disclosures"],
   journal: ["Journal", "Analysis, education and podcasts"],
   tools: ["Tools", "Calculators built around your money"],
   worldclock: ["World Clock", "Global trading sessions at a glance"],
@@ -241,7 +240,6 @@ async function go(page) {
   if (page === "cryptotech") await loadCryptoTechCached();
   if (["dashboard", "sentiment", "sectors", "macro", "news", "announcements"].includes(page)) await loadExtras();
   if (page === "announcements") await loadAllPsxAnnouncements();
-  if (page === "insider") await loadPsxInsiderTransactions();
   if (page === "macro") await loadMacroPage();
 }
 
@@ -1053,11 +1051,6 @@ function renderSymbolPage() {
     const price = live?.price;
     const changePct = live?.change_pct;
     const pe = live?.pe_ratio;
-    const eps = live?.eps;
-    const bookValue = live?.book_value_per_share;
-    const priceToBook = live?.price_to_book;
-    const dividendYield = live?.dividend_yield;
-    const avgVolume = live?.volume_30d_avg;
     const rsi = live?.rsi14;
     const trend = live?.golden_death_cross;
     const dataDays = live?.data_days || 0;
@@ -1075,12 +1068,14 @@ function renderSymbolPage() {
           ${changePct == null ? "—" : `${changePct >= 0 ? "+" : ""}${Number(changePct).toFixed(2)}%`}
         </td>
         <td>${volume == null ? "—" : Number(volume).toLocaleString()}</td>
-        <td>${avgVolume == null ? "—" : Number(avgVolume).toLocaleString()}</td>
+        <td>${live?.volume_1d == null ? "—" : Number(live.volume_1d).toLocaleString()}</td>
+        <td>${live?.volume_1w == null ? "—" : Number(live.volume_1w).toLocaleString()}</td>
+        <td>${live?.volume_1m == null ? "—" : Number(live.volume_1m).toLocaleString()}</td>
+        <td>${live?.volume_30d_avg == null ? "—" : Number(live.volume_30d_avg).toLocaleString(undefined,{maximumFractionDigits:0})}</td>
         <td>${pe == null ? "—" : Number(pe).toFixed(2)}</td>
-        <td>${eps == null ? "—" : Number(eps).toFixed(2)}</td>
-        <td>${bookValue == null ? "—" : Number(bookValue).toFixed(2)}</td>
-        <td>${priceToBook == null ? "—" : Number(priceToBook).toFixed(2)}</td>
-        <td>${dividendYield == null ? "—" : `${Number(dividendYield).toFixed(2)}%`}</td>
+        <td>${live?.eps_ttm == null ? "—" : Number(live.eps_ttm).toFixed(2)}</td>
+        <td>${live?.book_value_per_share == null ? "—" : Number(live.book_value_per_share).toFixed(2)}</td>
+        <td>${live?.dividend_yield_pct == null ? "—" : `${Number(live.dividend_yield_pct).toFixed(2)}%`}</td>
         <td>
           ${rsi == null
             ? `<span class="soft-chip" title="Needs 15 recorded trading days">${dataDays}/15 days</span>`
@@ -1117,8 +1112,8 @@ async function loadLiveQuotes() {
     d.items.forEach(q => { liveQuoteMap[q.symbol] = q; });
 
     $("liveQuotesStatus").textContent = d.updated_at
-      ? `PSX quotes: ${d.items.length} symbols, updated ${new Date(d.updated_at).toLocaleTimeString()} · ${d.source || "official PSX feed"}`
-      : "PSX quotes: fetching the official market-wide snapshot…";
+      ? `Live prices: ${d.items.length} symbols, updated ${new Date(d.updated_at).toLocaleTimeString()}`
+      : "Live prices: fetching for the first time…";
 
     if (d.recording_progress) {
       const p = d.recording_progress;
@@ -1417,24 +1412,12 @@ async function loadFundamentals(symbol) {
       metric("1Y Change", f.one_year_change_pct == null ? null : `${Number(f.one_year_change_pct).toFixed(2)}%`) +
       metric("YTD Change", f.ytd_change_pct == null ? null : `${Number(f.ytd_change_pct).toFixed(2)}%`) +
       metric("LDCP", f.ldcp == null ? null : Number(f.ldcp).toFixed(2)) +
-      metric(f.eps_ttm != null ? "EPS (TTM)" : "EPS (Latest Annual)", f.eps_ttm != null ? Number(f.eps_ttm).toFixed(2) : (f.eps_latest_annual == null ? null : Number(f.eps_latest_annual).toFixed(2))) +
+      metric("EPS (TTM)", f.eps_ttm == null ? null : Number(f.eps_ttm).toFixed(2)) +
       metric("Book Value / Share", f.book_value_per_share == null ? null : Number(f.book_value_per_share).toFixed(2)) +
-      metric("P/B", f.price_to_book == null ? null : Number(f.price_to_book).toFixed(2)) +
       metric("Dividend Yield", f.dividend_yield_pct == null ? null : `${Number(f.dividend_yield_pct).toFixed(2)}%`) +
-      metric("1D Volume", f.volume_1d == null ? null : Number(f.volume_1d).toLocaleString()) +
-      metric("1W Volume", f.volume_1w == null ? null : Number(f.volume_1w).toLocaleString()) +
-      metric("1M Volume", f.volume_1m == null ? null : Number(f.volume_1m).toLocaleString()) +
-      metric("1W Avg Volume", f.avg_volume_1w == null ? null : Number(f.avg_volume_1w).toLocaleString()) +
-      metric("1M Avg Volume", f.avg_volume_1m == null ? null : Number(f.avg_volume_1m).toLocaleString()) +
-      metric("30D Avg Volume", f.volume_30d_avg == null ? null : Number(f.volume_30d_avg).toLocaleString()) +
-      metric("Face Value", f.face_value == null ? null : Number(f.face_value).toFixed(2)) +
       metric("Dividend / Share", f.dividend_per_share == null ? null : Number(f.dividend_per_share).toFixed(2)) +
-      metric("Payout Ratio", f.dividend_payout_pct == null ? null : `${Number(f.dividend_payout_pct).toFixed(2)}%`) +
-      metric("Debt / Equity", f.debt_to_equity == null ? null : Number(f.debt_to_equity).toFixed(2)) +
-      metric("Current Ratio", f.current_ratio == null ? null : Number(f.current_ratio).toFixed(2)) +
-      metric("ROE", f.return_on_equity_pct == null ? null : `${Number(f.return_on_equity_pct).toFixed(2)}%`) +
-      metric("ROA", f.return_on_assets_pct == null ? null : `${Number(f.return_on_assets_pct).toFixed(2)}%`) +
-      metric("Free Float", f.free_float_pct == null ? null : `${Number(f.free_float_pct).toFixed(2)}%`);
+      metric("Market Cap", f.market_cap == null ? null : Number(f.market_cap).toLocaleString()) +
+      metric("Dividend History", f.dividend_history.length ? `${f.dividend_history.length} records` : null);
 
     if (f.pe_ratio_ttm != null) {
       const peScaled = Math.max(0, Math.min(100, (f.pe_ratio_ttm / 40) * 100));
@@ -1643,32 +1626,6 @@ async function loadExtras() {
   }
 }
 
-async function loadPsxInsiderTransactions() {
-  const el = $("insiderTransactionsList");
-  if (!el) return;
-  el.innerHTML = `<div class="loading-panel">Loading PSX insider/director disclosures…</div>`;
-  try {
-    const d = await getJSON("/api/psx/insider-transactions?limit=100");
-    const rows = d.transactions || [];
-    el.innerHTML = rows.length ? rows.map(item => {
-      const direction = item.direction === "buy" ? "BUY" : item.direction === "sell" ? "SELL" : "DISCLOSURE";
-      const body = `
-        <div class="announcement-symbol">${esc(item.symbol || "PSX")}</div>
-        <div>
-          <strong>${esc(item.title || item.text || "PSX insider disclosure")}</strong>
-          <small>${esc(direction)}${item.date ? ` · ${esc(item.date)}` : ""} · Official PSX filing</small>
-        </div>`;
-      return item.url
-        ? `<a class="announcement-card clickable-row" href="${esc(item.url)}" target="_blank" rel="noopener">${body}</a>`
-        : `<div class="announcement-card">${body}</div>`;
-    }).join("") : `<div class="empty-chart">No insider/director disclosure filings were returned by PSX right now.</div>`;
-    const note = $("insiderTransactionsNote");
-    if (note) note.textContent = d.note || "";
-  } catch (e) {
-    el.innerHTML = `<div class="error-panel">Could not load PSX insider disclosures: ${esc(e.message)}</div>`;
-  }
-}
-
 async function loadAllPsxAnnouncements() {
   const el = $("announcementListAll");
   if (!el) return;
@@ -1676,12 +1633,11 @@ async function loadAllPsxAnnouncements() {
   try {
     const d = await getJSON("/api/psx/announcements?limit=100");
     const rows = d.announcements || [];
-    el.innerHTML = rows.length ? rows.map(item => {
-      const body = `<div class="announcement-symbol">${esc(item.symbol || "PSX")}</div><div><strong>${esc(item.title || item.text || "PSX announcement")}</strong><small>${esc(item.category || "Official PSX announcement")}${item.date ? ` · ${esc(item.date)}` : ""}</small></div>`;
-      return item.url
-        ? `<a class="announcement-card clickable-row" href="${esc(item.url)}" target="_blank" rel="noopener">${body}</a>`
-        : `<div class="announcement-card">${body}</div>`;
-    }).join("") : `<div class="empty-chart">No announcements were returned right now.</div>`;
+    el.innerHTML = rows.length ? rows.map(item => `
+      <a class="announcement-card clickable-row" href="${esc(item.url)}" target="_blank" rel="noopener">
+        <div class="announcement-symbol">${esc(item.symbol || "PSX")}</div>
+        <div><strong>${esc(item.title)}</strong><small>Official PSX company announcement</small></div>
+      </a>`).join("") : `<div class="empty-chart">No announcements were returned right now.</div>`;
   } catch (e) {
     el.innerHTML = `<div class="error-panel">Could not load PSX announcements: ${esc(e.message)}</div>`;
   }
@@ -3414,10 +3370,6 @@ async function loadDashboardTickers() {
 
     const psxItems = stocks.items.filter(s => s.price != null).slice(0, 15)
       .map(s => ({ symbol: s.symbol, price: Number(s.price).toFixed(2), pct: Number(s.change_pct || 0) }));
-    const psxStatus = stocks.market_status || {};
-    const psxLabel = psxStatus.is_open
-      ? "PSX LIVE"
-      : `PSX LIVE · CLOSED · LAST SESSION ${psxStatus.last_session_date || ""}`;
 
     const cryptoItems = crypto.coins.slice(0, 15)
       .map(c => ({ symbol: c.symbol, price: "$" + Number(c.current_price).toLocaleString(undefined, {maximumFractionDigits: c.current_price < 1 ? 4 : 2}), pct: Number(c.price_change_percentage_24h || 0) }));
@@ -3428,8 +3380,10 @@ async function loadDashboardTickers() {
     const fundItems = funds.funds.filter(f => f.nav != null).slice(0, 15)
       .map(f => ({ symbol: f.name.slice(0, 22), price: Number(f.nav).toFixed(2), pct: Number(f.ytd || 0) }));
 
+    const psxLabel = stocks.market_state === "CLOSED" ? "PSX • CLOSED • LAST SESSION" : (stocks.market_state === "LIVE" ? "PSX LIVE" : "PSX LIVE • FEED UNAVAILABLE");
+    const psxStrip = psxItems.length ? buildTickerStrip(psxLabel, psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">${esc(psxLabel)}</span><span class="ticker-item">${esc(stocks.market_message || "Waiting for a real PSX quote feed…")}</span></div>`;
     $("globalTickerBar").innerHTML = [
-      psxItems.length ? buildTickerStrip(psxLabel, psxItems) : `<div class="ticker-strip"><span class="ticker-strip-label">${esc(psxLabel)}</span></div>`,
+      psxStrip,
       cryptoItems.length ? buildTickerStrip("CRYPTO LIVE", cryptoItems) : "",
       forexItems.length ? buildTickerStrip("FOREX LIVE", forexItems) : "",
       fundItems.length ? buildTickerStrip("MUTUAL FUNDS", fundItems) : "",
@@ -3522,21 +3476,6 @@ async function loadScreener() {
   }
   populateScreenerSectors();
   renderScreenerPresets();
-  await loadLastSavedScreener();
-}
-
-async function loadLastSavedScreener() {
-  try {
-    const d = await getJSON("/api/screener/last");
-    if (!d.ok || !d.found || !d.result) return;
-    const r = d.result;
-    renderActiveFilterChips(d.criteria || {});
-    $("screenerResultCount").textContent = `${r.count} match${r.count === 1 ? "" : "es"} of ${r.scanned} scanned · Last scan ${new Date(d.saved_at || r.saved_at).toLocaleString()}`;
-    $("screenerResults").innerHTML = r.results && r.results.length
-      ? `<div class="muted-note">Restored saved screener results after server restart.</div>` + `<table><thead><tr><th>Symbol</th><th>Company</th><th>Sector</th><th>Price</th><th>Change %</th><th>P/E</th><th>Volume</th></tr></thead><tbody>${r.results.map(x => `<tr class="clickable-row" data-symbol-open="${esc(x.symbol)}"><td class="symbol">${esc(x.symbol)}</td><td>${esc(x.company || "—")}</td><td>${esc(x.sector || "—")}</td><td>${x.price == null ? "—" : Number(x.price).toFixed(2)}</td><td>${x.change_pct == null ? "—" : `${Number(x.change_pct).toFixed(2)}%`}</td><td>${x.pe_ratio == null ? "—" : Number(x.pe_ratio).toFixed(2)}</td><td>${x.volume == null ? "—" : Number(x.volume).toLocaleString()}</td></tr>`).join("")}</tbody></table>`
-      : `<div class="empty-chart">No stocks matched the saved filters.</div>`;
-    document.querySelectorAll("[data-symbol-open]").forEach(el => el.addEventListener("click", () => openStock(el.dataset.symbolOpen)));
-  } catch (_) {}
 }
 
 function populateScreenerSectors() {
@@ -3660,45 +3599,6 @@ function renderActiveFilterChips(criteria) {
     : `<span class="muted-note">No filters yet — add some above, then press Run Screener.</span>`;
 }
 
-function renderManualScreenerVerdict(d) {
-  const el=$("manualScreenerResults");
-  if (!el) return;
-  if (!d.ok) { el.innerHTML=`<div class="error-panel">${esc(d.error || "Could not evaluate stock")}</div>`; return; }
-  const c=d.conditions||[];
-  const rows=c.map(x=>{
-    const state=x.passed===true ? "PASS" : x.passed===false ? "FAIL" : "UNAVAILABLE";
-    const cls=x.passed===true ? "positive" : x.passed===false ? "negative" : "muted-note";
-    let value=x.value;
-    if (typeof value === "number") value=Math.abs(value)>=1000 ? Number(value).toLocaleString(undefined,{maximumFractionDigits:2}) : Number(value).toFixed(2);
-    return `<tr><td><strong>${esc(x.label)}</strong><small>${esc(x.rule||"")}</small></td><td>${value==null?"—":esc(String(value))}</td><td class="${cls}"><strong>${state}</strong></td></tr>`;
-  }).join("");
-  const p=d.personalized_setup;
-  const ps=p && p.available!==false ? `<div class="tech-scan-block"><h4>Personalized RSI-Divergence Setup</h4><div class="manual-setup-grid">
-    <span>52W low ≤3%: <b>${p.near_52w_low?"PASS":"FAIL"}</b></span>
-    <span>1D bull div: <b>${p.bullish_divergence_1d?"YES":"NO"}</b></span><span>1W bull div: <b>${p.bullish_divergence_1w?"YES":"NO"}</b></span><span>1M bull div: <b>${p.bullish_divergence_1m?"YES":"NO"}</b></span>
-    <span>1D bear div: <b>${p.bearish_divergence_1d?"YES":"NO"}</b></span><span>1W bear div: <b>${p.bearish_divergence_1w?"YES":"NO"}</b></span><span>1M bear div: <b>${p.bearish_divergence_1m?"YES":"NO"}</b></span>
-    <span>Bull RSI ≤50: <b>${p.bullish_rsi_50?"PASS":"FAIL"}</b></span><span>Strong bull ≤30: <b>${p.bullish_rsi_30?"PASS":"FAIL"}</b></span>
-    <span>Bear RSI ≥70: <b>${p.bearish_rsi_70?"PASS":"FAIL"}</b></span><span>Strong bear ≥90: <b>${p.bearish_rsi_90?"PASS":"FAIL"}</b></span>
-    <span>Heikin-Ashi: <b>${esc(p.heikin_ashi||"—")}</b></span><span>Structure: <b>${esc(p.structure||"—")}</b></span>
-    <span>Final personalized match: <b>${p.personalized_match?"YES":"NO"}</b>${p.setup?` · ${esc(p.setup)}`:""}</span>
-  </div></div>` : `<div class="muted-note">Personalized divergence setup could not be evaluated: ${esc(p?.error || "insufficient real history")}</div>`;
-  el.innerHTML=`<div class="tech-scan-block"><h3>${esc(d.symbol)}${d.company?` — ${esc(d.company)}`:""}</h3><p class="muted-note">Price: <b>${d.price==null?"—":Number(d.price).toFixed(2)}</b> · Real history: <b>${Number(d.data_days||0).toLocaleString()} trading days</b> · <b>${d.summary.passed}</b> pass · <b>${d.summary.failed}</b> fail · <b>${d.summary.unavailable}</b> unavailable</p><div class="tech-scan-table-wrap"><table><thead><tr><th>My Screener Point</th><th>Measured Value</th><th>Verdict</th></tr></thead><tbody>${rows}</tbody></table></div></div>${ps}`;
-}
-
-async function checkManualScreenerStock() {
-  const input=$("manualScreenerSymbol"); const btn=$("manualScreenerCheckBtn"); const el=$("manualScreenerResults");
-  const symbol=(input?.value||"").trim().toUpperCase();
-  if (!symbol) { if(el) el.innerHTML=`<div class="error-panel">Enter a PSX symbol first.</div>`; return; }
-  if(btn) { btn.disabled=true; btn.textContent="Checking…"; }
-  if(el) el.innerHTML=`<div class="loading-panel">Checking ${esc(symbol)} against the real PSX technical history…</div>`;
-  try { const d=await getJSON(`/api/screener/stock-verdict/${encodeURIComponent(symbol)}`); renderManualScreenerVerdict(d); }
-  catch(e) { if(el) el.innerHTML=`<div class="error-panel">${esc(e.message)}</div>`; }
-  finally { if(btn) { btn.disabled=false; btn.textContent="Check Stock"; } }
-}
-
-$("manualScreenerCheckBtn")?.addEventListener("click", checkManualScreenerStock);
-$("manualScreenerSymbol")?.addEventListener("keydown", e=>{ if(e.key==="Enter") checkManualScreenerStock(); });
-
 async function runScreener(presetCriteria = null) {
   const criteria = presetCriteria || collectScreenerCriteria();
   renderActiveFilterChips(criteria);
@@ -3718,7 +3618,7 @@ async function runScreener(presetCriteria = null) {
     if (!response.ok) throw new Error(`Request failed: ${response.status}`);
     const d = await response.json();
 
-    $("screenerResultCount").textContent = `${d.count} match${d.count === 1 ? "" : "es"} of ${d.scanned} scanned${d.saved_at ? ` · Last scan ${new Date(d.saved_at).toLocaleString()}` : ""}`;
+    $("screenerResultCount").textContent = `${d.count} match${d.count === 1 ? "" : "es"} of ${d.scanned} scanned${d.last_scan_at ? ` • Last scan ${new Date(d.last_scan_at).toLocaleString()}` : ""}${d.stale ? " • saved result" : ""}`;
 
     $("screenerResults").innerHTML = d.results.length
       ? `
@@ -3754,6 +3654,13 @@ async function runScreener(presetCriteria = null) {
     btn.disabled = false;
     btn.textContent = old;
   }
+}
+
+async function checkSingleStockAgainstScreener(symbol, criteria) {
+  const d = await getJSON("/api/screener/check-stock", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({symbol, criteria})});
+  if (!d.ok) throw new Error(d.error || "Could not check stock");
+  const rows = (d.checks || []).map(c => `<tr><td>${esc(c.label)}</td><td class="${c.matched ? "positive" : "negative"}">${c.matched ? "✓ Follows" : "✗ Does not follow"}</td></tr>`).join("");
+  return `<div class="card"><h3>${esc(d.symbol)} — Screener Check</h3><p class="muted-note">${d.matched} of ${d.total} selected conditions satisfied.</p><table><tbody>${rows || `<tr><td>No technical conditions selected.</td></tr>`}</tbody></table></div>`;
 }
 
 $("runScreenerBtn")?.addEventListener("click", runScreener);
@@ -3961,7 +3868,6 @@ const PSX_DIV_COLS = [
   { key: "week52_low", label: "52W Low", fmt: "num2" },
   { key: "pct_above_52w_low", label: "% Above 52W Low", fmt: "pct" },
   { key: "latest_rsi", label: "RSI (14)", fmt: "num1" },
-  { key: "volume", label: "Volume", fmt: "int" },
   { key: "div_1d", label: "1D Divergence" },
   { key: "div_1w", label: "1W Divergence" },
   { key: "div_1m", label: "1M Divergence" },
@@ -3973,7 +3879,6 @@ const PSX_DIV_COLS = [
   { key: "bearish_rsi_90", label: "Bear Div ≥90" },
   { key: "ha_color", label: "Heikin-Ashi" },
   { key: "structure", label: "Structure" },
-  { key: "personalized_setup", label: "Personalized Setup" },
 ];
 
 function renderPsxDivTable(rows, cols) {
@@ -4000,10 +3905,8 @@ function renderPsxDivTable(rows, cols) {
 }
 
 function renderPsxDivergenceResult(result, resultsEl) {
-  const scanTime = result.scan_completed_at || result.scan_started_at || result.saved_at || null;
-  const scanSummary = `<div class="tech-scan-block"><h3>Scan Summary</h3><p class="muted-note">Last completed scan: <strong>${scanTime ? esc(new Date(scanTime).toLocaleString()) : "—"}</strong>${result.scan_duration_seconds != null ? ` · Duration: <strong>${Number(result.scan_duration_seconds).toFixed(1)}s</strong>` : ""}<br>Universe: <strong>${Number(result.universe_count || result.symbols_scanned || 0).toLocaleString()}</strong> symbols · Usable data: <strong>${Number(result.symbols_with_data || 0).toLocaleString()}</strong> · Insufficient history: <strong>${Number(result.symbols_skipped_insufficient_history || 0).toLocaleString()}</strong> · Failed: <strong>${Number(result.symbols_failed || 0).toLocaleString()}</strong> · Bullish divergence hits: <strong>${Number((result.bullish_divergence_all || []).length).toLocaleString()}</strong> · Bearish divergence hits: <strong>${Number((result.bearish_divergence_all || []).length).toLocaleString()}</strong></p></div>`;
   const sections = [
-    ["personalized_matches", "Personalized PSX Setup — Confirmed Matches", "A bullish reversal requires all of: within 3% of the 52-week low, bullish RSI divergence on at least one of 1D/1W/1M, pivot RSI ≤50 (strong ≤30), downtrend structure (LH+LL), and a green Heikin-Ashi confirmation. A bearish reversal requires bearish divergence on at least one timeframe, pivot RSI ≥70 (strong ≥90), uptrend structure (HH+HL), and a red Heikin-Ashi confirmation."],
+    ["personalized_matches", "Personalized PSX Setup — All Matches", "A stock appears here when it meets at least one requested condition: within 3% of its 52-week low, RSI divergence on 1D/1W/1M, bullish divergence with pivot RSI ≤30 or ≤50, bearish divergence with pivot RSI ≥70 or ≥90, or a Heikin-Ashi/trend confirmation."],
     ["near_low_bullish_divergence", "52-Week Low + Bullish RSI Divergence", "Price is within the configured 3% of its 52-week low AND has a mathematically confirmed bullish RSI divergence."],
     ["near_low", "All Stocks Near Their 52-Week Low", "Every scanned stock within 3% of its 52-week low."],
     ["bullish_divergence_all", "All Bullish RSI Divergence — Market Wide", "Every stock with confirmed bullish divergence, independent of its 52-week position."],
@@ -4012,7 +3915,7 @@ function renderPsxDivergenceResult(result, resultsEl) {
     ["downtrend_divergence", "Divergence Within a Downtrend", "Confirmed divergence occurring in a lower-high/lower-low structure."],
   ];
 
-  let html = scanSummary;
+  let html = "";
   for (const [key, title, desc] of sections) {
     html += `<div class="tech-scan-block"><h3>${esc(title)}</h3><p class="muted-note">${esc(desc)}</p>${renderPsxDivTable(result[key])}</div>`;
   }
@@ -4045,24 +3948,8 @@ async function runPsxDivergenceScan() {
       throw new Error("Server returned an invalid scan job ID. Please reload the page and try again.");
     }
 
-    let transientStatusErrors = 0;
     while (true) {
-      let data;
-      try {
-        data = await getJSON("/api/psxdivergence/scan/status/" + encodeURIComponent(jobId), { timeoutMs: 10000 });
-        transientStatusErrors = 0;
-      } catch (statusErr) {
-        // Render/iPad can occasionally surface a transient HTML 502 while a
-        // worker is busy. Do not throw away a valid long-running scan: retry
-        // the tiny status endpoint before declaring the scan failed.
-        transientStatusErrors += 1;
-        if (transientStatusErrors <= 8) {
-          statusEl.textContent = `Reconnecting to scan worker… (${transientStatusErrors}/8)`;
-          await new Promise(r => setTimeout(r, Math.min(8000, 1500 * transientStatusErrors)));
-          continue;
-        }
-        throw statusErr;
-      }
+      const data = await getJSON("/api/psxdivergence/scan/status/" + encodeURIComponent(jobId), { timeoutMs: 30000 });
       if (!data.ok || data.status === "error") {
         statusEl.textContent = "Error: " + (data.error || "scan failed");
         return;
@@ -4071,11 +3958,10 @@ async function runPsxDivergenceScan() {
         renderPsxDivergenceResult(data.result, resultsEl);
         const total = Number(data.result?.symbols_scanned || 0);
         const failed = Number(data.result?.symbols_failed || 0);
-        const skipped = Number(data.result?.symbols_skipped_insufficient_history || 0);
-        const usable = Number(data.result?.symbols_with_data ?? 0);
+        const usable = Number(data.result?.symbols_with_data ?? Math.max(0, total - failed));
         const universe = Number(data.result?.universe_count || total);
         statusEl.textContent = total
-          ? `Full PSX scan complete — ${total.toLocaleString()} of ${universe.toLocaleString()} PSX symbols checked; ${usable.toLocaleString()} had usable history${skipped ? `; ${skipped.toLocaleString()} skipped for insufficient history` : ""}${failed ? `; ${failed.toLocaleString()} failed.` : "."}`
+          ? `Full PSX scan complete — ${total.toLocaleString()} of ${universe.toLocaleString()} PSX symbols checked; ${usable.toLocaleString()} returned usable history${failed ? `; ${failed.toLocaleString()} failed.` : "."}`
           : "Scan complete — no PSX symbols were returned.";
         return;
       }
@@ -4174,9 +4060,7 @@ async function loadStockChart(symbol, timeframe) {
       ["mainPriceChart", "volumeChart", "rsiChart", "macdChart"].forEach(id => { if ($(id)) $(id).innerHTML = ""; });
       return;
     }
-    statusEl.textContent = d.data_source
-      ? `${d.data_source} · ${d.timeframe || currentChartTimeframe}${d.candle_interval ? ` · ${d.candle_interval} candles` : ""}${d.history_span ? ` · ${d.history_span}` : ""}`
-      : "";
+    statusEl.textContent = d.data_source ? `Real market data: ${d.data_source}` : "";
     lastChartData = d;
     // Render on the next paint so the stock-detail page has a real width
     // after navigation; Lightweight Charts otherwise initializes at 0px on
@@ -4319,3 +4203,5 @@ window.addEventListener("resize", () => {
     }
   });
 });
+
+window.checkSingleStockAgainstScreener = checkSingleStockAgainstScreener;
